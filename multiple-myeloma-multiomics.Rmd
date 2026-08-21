@@ -1,0 +1,2491 @@
+---
+title: "Multiple myeloma reanalysis"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, cache=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, error = FALSE,
+                      cache = TRUE, cache.lazy = FALSE, dev=c('pdf','png'))
+```
+
+```{r loadLibraries, cache=FALSE}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(janitor)
+library(ggpubr)
+library(colorDF)
+library(ComplexHeatmap)
+library(cluster)
+library(circlize)
+library(DT)
+library(dplyr)
+library(mixOmics)
+library(gtools)
+library(RColorBrewer)
+library(cowplot)
+library(GEOquery)
+library(ggsurvfit)
+library(survminer)
+library(survival)
+library(ggrepel)
+library(readr)
+```
+
+# loading / filtering data
+
+get patient annotation, CNV data (nanopore sequencing; table S3), RNA-seq (table S2), proteome results (table S6) and phosphoproteome results (table S7) from [Supplementary Tables](https://static-content.springer.com/esm/art%3A10.1038%2Fs43018-024-00784-3/MediaObjects/43018_2024_784_MOESM2_ESM.xlsx) of the paper
+
+```{r load_supplementary_tables}
+meta2 <- readxl::read_excel('data/43018_2024_784_MOESM2_ESM.xlsx', 
+                                    sheet=3, range="E1:DX8", col_names=FALSE) %>%
+  tibble::column_to_rownames('...1') %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::remove_rownames() %>%
+  tibble::column_to_rownames('TMT_ID')
+colnames(meta2) <- gsub(' status.*','', colnames(meta2))
+
+rnaseq.data <- readxl::read_excel('data/43018_2024_784_MOESM2_ESM.xlsx', 
+                               sheet=3, skip=7) %>%
+  dplyr::select(-TMT_ID)
+
+meta3 <- readxl::read_excel('data/43018_2024_784_MOESM2_ESM.xlsx',
+                                    sheet=4, range="B1:DZ7", col_names=FALSE) %>%
+  tibble::column_to_rownames('...1') %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::remove_rownames() %>%
+  tibble::column_to_rownames('TMT_ID')
+colnames(meta3) <- gsub(' status.*','', colnames(meta3))
+
+cnv.data <- readxl::read_excel('data/43018_2024_784_MOESM2_ESM.xlsx', 
+                               sheet=4, skip=6) %>%
+  dplyr::select(-TMT_ID)
+
+meta6 <- readxl::read_excel('data/43018_2024_784_MOESM2_ESM.xlsx',
+                                    sheet=7, range="BO1:HF7", col_names=FALSE) %>%
+  tibble::column_to_rownames('...1') %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::remove_rownames() %>%
+  tibble::column_to_rownames('TMT_ID')
+colnames(meta6) <- gsub(' status.*','', colnames(meta6))
+
+proteome.data <- readxl::read_excel('data/43018_2024_784_MOESM2_ESM.xlsx', 
+                                    sheet=7, skip=6) %>%
+  dplyr::select(-TMT_ID)
+
+meta7 <- readxl::read_excel('data/43018_2024_784_MOESM2_ESM.xlsx',
+                                    sheet=8, range="BW1:HN7", col_names=FALSE) %>%
+  tibble::column_to_rownames('...1') %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::remove_rownames() %>%
+  tibble::column_to_rownames('TMT_ID')
+colnames(meta7) <- gsub(' status.*','', colnames(meta7))
+
+phospho.data <- readxl::read_excel('data/43018_2024_784_MOESM2_ESM.xlsx', 
+                                   sheet=8, skip=6) %>%
+  dplyr::select(-TMT_ID)
+
+channel_annot <- readxl::read_excel('data/43018_2024_784_MOESM2_ESM.xlsx',
+                                    sheet=12) %>%
+  janitor::clean_names() %>%
+  dplyr::mutate(tmt_id=janitor::make_clean_names(tmt_id)) 
+```
+
+filter for patients with info in all 4 modalities and use only loci / mRNAs / proteins / phosphoproteins without missing data or annotation; add additional cohort annotations (e.g., RNA quality)
+
+```{r filter}
+library(matrixStats)
+patients <- Reduce(intersect, list(row.names(meta2),
+                                   row.names(meta3), 
+                                   row.names(meta6), 
+                                   row.names(meta7)))
+meta <- meta2[patients, c('Status','genetic.subgroup','chr9q','chr1q','chr13q','chr17','use_for_correlation')] %>%
+  janitor::clean_names()
+row.names(meta) <- janitor::make_clean_names(row.names(meta))
+
+# cohort.annot <- readxl::read_excel("data/20220714_proteogenomic_annotation_table.xlsx", na = c("NA", "")) %>%
+#   janitor::clean_names() %>%
+#   dplyr::rename(plasma_before = plasmacell_content_before_macs,
+#                 plasma_after = plasmacell_content_after_macs) %>%
+#   dplyr::mutate(plasma_after = stringr::str_remove(plasma_after, ">")) %>%
+#   dplyr::mutate(plasma_after = as.numeric(plasma_after)) %>%
+#   dplyr::mutate(plasma_cells = ifelse(is.na(plasma_after), plasma_before, plasma_after)) %>%
+#   dplyr::rename(disease = status) %>%
+#   dplyr::mutate(tmt_id = janitor::make_clean_names(stringr::str_to_lower(tmt_id)),
+#                 chr9q34_2 = x9q34_2_status,
+#                 chr1q21 = as.numeric(x1q21_status > 0),
+#                 chr13q14 = x13q14_status,
+#                 chr17p13_1 = as.numeric(x17p13_1_status),
+#                 t_4_14 =  t_4_14_status,
+#                 t_11_14 = t_11_14_status,
+#                 t_14_16 = t_14_16_status)
+# 
+# rna.annot <- rbind(readxl::read_excel("data/DV200-Werte_Jan Krönke_2019_2020.xlsx",
+#                                       sheet=1) %>%
+#                      dplyr::select(`Sample ID`, `% DV200`),
+#                    readxl::read_excel("data/DV200-Werte_Jan Krönke_2019_2020.xlsx",
+#                                       sheet=2) %>%
+#                      dplyr::select(`Sample ID`, `% DV200`),
+#                    readxl::read_excel("data/DV200-Werte_Jan Krönke_2019_2020.xlsx",
+#                                       sheet=3) %>%
+#                      dplyr::select(`Sample ID`, `% DV200`))
+# colnames(rna.annot) <- c('dna_rna_id','rna_quality')
+# 
+# anno <- cohort.annot %>%
+#   dplyr::select(-genetic_subgroup) %>%
+#   dplyr::left_join(rna.annot %>%
+#                      dplyr::distinct(dna_rna_id, .keep_all=TRUE),
+#                    by='dna_rna_id') %>%
+#   dplyr::select(tmt_id, disease, chr9q34_2, chr1q21, chr13q14, chr17p13_1,t_4_14, t_11_14, t_14_16,
+#                 rna_quality, macs_protein, age, gender, plasma_cells,
+#                 os, os_in_days, pfs, pfs_in_days, r_iss, iss)
+# 
+# write.csv(anno,'data/cohort_annotation.csv')
+
+anno <- read.csv('data/cohort_annotation.csv', header=1, row.names=1)
+
+meta <- meta %>%
+  tibble::rownames_to_column('tmt_id') %>%
+  dplyr::left_join(anno, by='tmt_id') %>%
+  tibble::column_to_rownames('tmt_id')
+
+CNV <- cnv.data[,c('chr.location',patients)] %>%
+  janitor::clean_names() %>%
+  tibble::column_to_rownames('chr_location') %>%
+  dplyr::mutate_all(funs(as.numeric)) %>%
+  as.matrix() %>%
+  t()
+
+CNV[CNV > 4] <- 4
+
+use.CNV <- (colSums(is.na(CNV))==0) & (colSds(CNV) > 0)
+use.CNV[nearZeroVar(CNV)$Position] <- FALSE
+
+RNA <- rnaseq.data[,c('Gene',patients)] %>%
+  janitor::clean_names() %>%
+  dplyr::distinct(gene, .keep_all=TRUE) %>%
+  tibble::column_to_rownames('gene') %>%
+  dplyr::mutate_all(funs(as.numeric)) %>%
+  as.matrix() %>%
+  t()
+
+use.RNA <- (colSums(is.na(RNA))==0) & (colSds(RNA) > 0)
+
+protein <- proteome.data[,c('realGN',patients)] %>%
+  janitor::clean_names() %>% 
+  dplyr::filter(!is.na(real_gn)) %>%
+  dplyr::mutate_at(vars(janitor::make_clean_names(patients)), funs(as.numeric)) %>%
+  dplyr::group_by(real_gn) %>%
+  dplyr::mutate(n_na=rowSums(is.na(pick(where(is.numeric))))) %>%
+  dplyr::slice_min(n_na, n=1, with_ties=FALSE) %>%
+  dplyr::select(-n_na) %>%
+  tibble::column_to_rownames('real_gn') %>%
+  as.matrix() %>%
+  t()
+
+use.protein <- (colSums(is.na(protein))==0) & (colSds(protein) > 0)
+
+phospho <- phospho.data[,c('realGN','firstSP.position','Amino.acid',patients)] %>%
+  janitor::clean_names() %>% 
+  dplyr::filter(!is.na(real_gn),!is.na(first_sp_position),!is.na(amino_acid)) %>%
+  dplyr::mutate(id=paste0(real_gn,'.',first_sp_position,'.',amino_acid)) %>%
+  dplyr::select(-c(real_gn,first_sp_position,amino_acid)) %>%
+  dplyr::distinct(id, .keep_all=TRUE) %>%
+  tibble::column_to_rownames('id') %>%
+  dplyr::mutate_all(funs(as.numeric)) %>%
+  as.matrix() %>%
+  t()
+
+use.phospho <- (colSums(is.na(phospho))==0) & (colSds(phospho) > 0)
+```
+
+this leaves us with `r length(patients)` patients and
+
+- `r sum(use.CNV)` features for CNV
+- `r sum(use.RNA)` for RNA
+- `r sum(use.protein)` for protein
+- `r sum(use.phospho)` for phospho
+- `r length(intersect(colnames(RNA[,use.RNA]),colnames(protein[,use.protein])))` features overlap between RNA and protein
+
+compute the risk score as in the paper
+
+```{r risk_score}
+risk_score=c('ANKZF1'=0.32047,
+             'UBE2Q1'=0.48563,
+             'PDSS2'=0.28132,
+             'TFB2M'=-0.26276,
+             'NCKAP1'=-0.16548,
+             'PTK2'=-0.28403,
+             'RDX'=-0.41152,
+             'BAG4'=-0.80625)
+
+meta$risk_score <- data.frame(protein[,names(risk_score)]) %>% 
+  dplyr::mutate_all(funs(tidyr::replace_na(.,0))) %>% 
+  as.matrix() %*% risk_score
+
+meta$risk <- factor(ifelse(meta$risk_score > quantile(meta$risk_score, .75),'high',
+                           ifelse(meta$risk_score < quantile(meta$risk_score, .25),
+                                  'low', 'medium')),
+                    levels=c('low','medium','high'))
+
+meta$UBE2Q1 <- ifelse(protein[,'UBE2Q1'] > median(protein[,'UBE2Q1']),'high','low')
+meta$group <- paste0(meta$UBE2Q1, ' ', ifelse(meta$x1q21_status==1,'gain','no gain'))
+```
+
+chromosomal locations
+
+```{r locs}
+loc.order <- data.frame(loc=colnames(CNV)) %>%
+  dplyr::mutate(chr=as.numeric(gsub('chr([0-9]*).*','\\1',loc)),
+                band=as.numeric(gsub('chr[0-9]*[pq]([0-9\\.]*)','\\1',loc)),
+                band=ifelse(grepl('p',loc),-band, band)) %>%
+  dplyr::arrange(chr, band) %>%
+  dplyr::pull(loc)
+
+RNA_locs <- rnaseq.data %>%
+  dplyr::select(Gene, chromosome_name, band) %>%
+  dplyr::mutate(loc=paste0('chr',chromosome_name,band)) %>%
+  dplyr::pull(loc, Gene)
+
+protein_locs <- proteome.data %>%
+  dplyr::select(realGN, chromosome_name, band) %>%
+  dplyr::mutate(loc=paste0(chromosome_name,band)) %>%
+  dplyr::pull(loc, realGN)
+
+phospho_locs <- phospho.data[,c('realGN','firstSP.position','Amino.acid','chromosome_name','band')] %>%
+  janitor::clean_names() %>% 
+  dplyr::filter(!is.na(real_gn),!is.na(first_sp_position),!is.na(amino_acid)) %>%
+  dplyr::mutate(id=paste0(real_gn,'.',first_sp_position,'.',amino_acid),
+                loc=paste0('chr',chromosome_name,band)) %>%
+  dplyr::pull(loc, id)
+```
+
+proliferation, NFkB index, GEP5, ZANS5 and DS30 scores
+
+```{r proliferation_nfkb_index}
+prolif_genes <- c("TYMS","TK1","CCNB1","MKI67","PCLAF","DYNC1H1",
+                  "CKS1B","TOP2A","UBE2C","ZWINT","TRIP13","KIF11")
+
+prolif_index <- rowMeans(RNA[, intersect(prolif_genes, colnames(RNA))],
+                         na.rm = TRUE)
+meta$prolif_index <- prolif_index[rownames(meta)]
+
+nfkb_genes <- c("BIRC3","TNFAIP3","NFKB2","IL2RG","NFKB1",
+                "RELB","NFKBIA","CD74","PLEK","MALT1","WNT10A")
+
+nfkb_index <- rowMeans(RNA[, intersect(nfkb_genes, colnames(RNA))],
+                       na.rm = TRUE)
+meta$nfkb_index <- nfkb_index[rownames(meta)]
+
+meta$HRD <- as.numeric(meta$genetic_subgroup=='HRD')
+
+# GEP-70 score based on just 5 genes
+meta$GEP5 <- rowMeans(RNA[row.names(meta), c('ENO1','FABP5','TRIP13','TAGLN2','RFC4')])
+
+ZANS5 <- c('CCT2'=0.768, 'PRKDC'=0.652, 'NONO'=0.642, 'UBE2A'=0.5, 'CKS1B'=0.293)
+meta$ZANS5 <- data.frame(RNA[row.names(meta),names(ZANS5)]) %>% 
+  dplyr::mutate_all(funs(tidyr::replace_na(.,0))) %>% 
+  as.matrix() %*% ZANS5
+
+DS30 <- c(
+  PHF19 = 0.1105,
+  FABP5 = 0.0740,
+  APOBEC3B = 0.0709,
+  LTBP1 = -0.0665,
+  TOP2A = 0.0573,
+  HTR2C = 0.0489,
+  FOXM1 = 0.0441,
+  ENSG00000237422 = 0.0426, # Novel transcript
+  BUB1 = 0.0416,
+  DENND2D = -0.0381,
+  NAP1L3 = 0.0307,
+  WEE1 = 0.0303,
+  PFKP = 0.0256,
+  SHROOM3 = 0.0244,
+  KIR3DX1 = 0.0216,
+  KIF21B = 0.0189,
+  PKDCC = 0.0188,
+  JAG2 = 0.0180,
+  FOXD1 = 0.0137,
+  MAGEA1 = 0.0111,
+  CDCA7 = 0.0102,
+  ELOVL6 = 0.0075,
+  HHAT = 0.0057,
+  CRIP2 = 0.0022,
+  SCRIB = 0.0015,
+  ADAM15 = 0.00004,
+  CEMIP = -0.0036,
+  TJP1 = -0.0046,
+  LAMA5 = -0.0117,
+  GRHL1 = -0.0129
+)
+
+gg30 <- intersect(names(DS30),colnames(RNA))
+meta$DS30 <- data.frame(RNA[row.names(meta),gg30]) %>% 
+  dplyr::mutate_all(funs(tidyr::replace_na(.,0))) %>% 
+  as.matrix() %*% DS30[gg30]
+```
+
+# prepare data
+
+use LIMMA for batch correction (using macs.protein + rna_quality for RNA and macs.protein for protein and phospho), and plot PCAs
+
+```{r limma, fig.width=10, fig.height=2.5}
+library(limma)
+plot_pca <- function(obj, color) {
+  plist <- lapply(names(obj), 
+                  function(x) cbind(obj[[x]]$x,
+                                    meta) %>%
+                    dplyr::mutate(macs_protein=as.factor(macs_protein)) %>%
+                    ggplot(aes_string(x='PC1', y='PC2', color=color)) +
+                    geom_point(size=1) + 
+                    theme_classic(base_size=8) +
+                    stat_ellipse() +
+                    theme(legend.key.size=unit(3,'mm')) +
+                    labs(title=x,
+                         x=paste0('PC1 (', signif(100*obj[[x]]$cum.var[[1]],0),'%)'),
+                         y=paste0('PC2 (', signif(100*(obj[[x]]$cum.var[[2]]-obj[[x]]$cum.var[[1]]),0),
+                                  '%)')))
+  cowplot::plot_grid(plotlist=c(lapply(plist, function(x) x + theme(legend.position='none')),
+                                list(cowplot::get_legend(plist[[1]]))), ncol=length(plist) + 1, align='vh')
+}  
+
+pca.uc <- list()
+pca.uc[['CNV']] <- pca(CNV[,use.CNV],ncomp=2, center=TRUE, scale=TRUE)
+pca.uc[['RNA']] <- pca(RNA[,use.RNA],ncomp=2, center=TRUE, scale=TRUE)
+pca.uc[['protein']] <- pca(protein[,use.protein],ncomp=2, center=TRUE, scale=TRUE)
+pca.uc[['phospho']] <- pca(phospho[,use.phospho],ncomp=2, center=TRUE, scale=TRUE)
+
+pca_plot_rna <- plot_pca(pca.uc, 'rna_quality')
+pca_plot_macs <- plot_pca(pca.uc, 'macs_protein')
+
+rna.bc <- t(removeBatchEffect(t(RNA[, use.RNA]), meta$macs_protein, covariates=meta$rna_quality))
+protein.bc <- t(removeBatchEffect(t(protein[, use.protein]), meta$macs_protein))
+phospho.bc <- t(removeBatchEffect(t(phospho[, use.phospho]), meta$macs_protein))
+
+pca.bc <- list()
+pca.bc[['CNV']] <- pca(CNV[,use.CNV],ncomp=2, center=TRUE, scale=TRUE)
+pca.bc[['RNA']] <- pca(rna.bc,ncomp=2, center=TRUE, scale=TRUE)
+pca.bc[['protein']] <- pca(protein.bc,ncomp=2, center=TRUE, scale=TRUE)
+pca.bc[['phospho']] <- pca(phospho.bc,ncomp=2, center=TRUE, scale=TRUE)
+
+pca_plot_rna_bc <- plot_pca(pca.bc, 'rna_quality')
+pca_plot_macs_bc <- plot_pca(pca.bc, 'macs_protein') 
+```
+
+```{r prepare_data}
+events <- c('HRD','chr1q21','chr9q34_2','chr13q14','chr17p13_1',
+            't_4_14','t_11_14','t_14_16')
+modalities <- c('CNV','RNA','protein','phospho')
+
+X <- list('CNV'=CNV[,use.CNV],
+          'RNA'=rna.bc,
+          'protein'=protein.bc,
+          'phospho'=phospho.bc)
+
+NCOMP <- 2
+keeps <- c(100,50,25,10,5)[1:NCOMP]
+
+mod_locs <- list('CNV'=setNames(loc.order, loc.order),
+                 'RNA'=RNA_locs,
+                 'protein'=protein_locs,
+                 'phospho'=phospho_locs)
+
+targets <- events[1:5]
+
+target_regex <- c('HRD'='^chr3[qp]|^chr5[qp]|^chr7[qp]|^chr9[qp]|^chr11[qp]|^chr15[qp]|^chr21[qp]',
+                  'chr1q21'='chr1q21',
+                  'chr9q34_2'='chr9q34',
+                  'chr13q14'='chr13q14',
+                  'chr17p13_1'='chr17p13')
+
+event_labels <- c('HRD','gain(1q)','gain(9q)','del(13q)','del(17p)', 't(4;14)','t(11;14)', 't(14;16)')
+event_colors <- setNames(c('black',brewer.pal('Set1',n=3),'gray',brewer.pal('Set2',n=3)), event_labels)
+
+modality_colors <- setNames(brewer.pal('Set3',n=8)[5:8], modalities)
+```
+
+```{r prep_tmod}
+library(msigdbr)
+library(tmod)
+
+hallmark  <- msigdbr(species="Homo sapiens", category="H") %>%
+  dplyr::select(gs_name, gene_symbol)
+
+reactome  <- msigdbr(species="Homo sapiens", category="C2", subcategory="CP:REACTOME") %>%
+  dplyr::select(gs_name, gene_symbol)
+
+gene_sets <- bind_rows(hallmark, reactome)
+
+make_tmod <- function(gene_sets_df) {
+  gs_list <- split(gene_sets_df$gene_symbol, gene_sets_df$gs_name)
+  
+  makeTmod(
+    modules = data.frame(
+      ID    = names(gs_list),
+      Title = names(gs_list) %>% 
+                gsub("HALLMARK_|REACTOME_", "", .) %>%
+                gsub("_", " ", .) %>%
+                str_to_title(),
+      N     = sapply(gs_list, length),
+      stringsAsFactors = FALSE
+    ),
+    modules2genes = gs_list
+  )
+}
+
+tmod_db <- make_tmod(gene_sets)
+tmod_db <- tmod_db[tmod_db$gs$N <= 200]
+```
+
+# Figure 1 + S1
+
+```{r cohort_overview}
+pt.order <- meta %>%
+  dplyr::arrange(genetic_subgroup) %>%
+  row.names()
+
+reorder <- c(1,6,7,8,2,3,4,5)
+
+event_anno_df <- meta[pt.order, events] %>%
+  dplyr::mutate(sample = pt.order) %>%
+  tidyr::pivot_longer(cols = all_of(events), 
+                      names_to = "event", values_to = "present") %>%
+  dplyr::mutate(
+    event  = factor(event, levels = rev(events[reorder]),labels = rev(event_labels[reorder])),
+    sample = factor(sample, levels = pt.order)
+  )
+
+cohort_overview <- ggplot(event_anno_df, aes(x = sample, y = event, fill = interaction(event, present))) +
+  geom_tile() +
+  scale_fill_manual(
+    values = c(
+      # present (1): use event color
+      setNames(event_colors[event_labels], paste0(event_labels, ".1")),
+      # absent (0): gray
+      setNames(rep("gray90", length(event_labels)), paste0(event_labels, ".0"))
+    ),
+    na.value = 'gray90'
+  ) +
+  theme_minimal(base_size=8) +
+  theme(
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "none",
+    panel.grid   = element_blank()
+  ) +
+  labs(x = NULL, y = NULL)
+
+features_per_modality <- data.frame('nfeatures'=sapply(X, function(x) dim(x)[2])) %>%
+  tibble::rownames_to_column('modality') %>%
+  dplyr::mutate(modality=factor(modality, levels=rev(c('CNV','RNA','protein','phospho')))) %>%
+  ggplot(aes(x=modality, y=nfeatures, fill=modality)) + 
+  geom_col() +
+  theme_classic(base_size=8) +
+  theme(legend.position='none') +
+  scale_fill_manual(values=modality_colors)  +
+  labs(x='',y='# features') +
+  coord_flip()
+```
+
+```{r data_quality_pca, fig.width=3, fig.height=2.5}
+pca.res <- list()
+pca.res[['CNV']] <- pca(CNV[,use.CNV],ncomp=10, center=TRUE, scale=TRUE)
+pca.res[['RNA']] <- pca(rna.bc,ncomp=10, center=TRUE, scale=TRUE)
+pca.res[['protein']] <- pca(protein.bc,ncomp=10, center=TRUE, scale=TRUE)
+pca.res[['phospho']] <- pca(phospho.bc,ncomp=10, center=TRUE, scale=TRUE)
+
+pca_variance <- map_dfr(names(pca.res), function(mod) {
+  var_obs <- pca.res[[mod]]$prop_expl_var$X
+
+  tibble(
+    Modality  = mod,
+    PC        = paste0("PC", 1:10),
+    PC_num    = 1:10,
+    obs       = var_obs,
+  )
+})
+
+data_quality_pca <- ggplot(pca_variance %>%
+                             dplyr::mutate(Modality=factor(Modality, levels=names(X))),
+                           aes(x = PC_num, y=100*obs, color=Modality)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = modality_colors) +
+  scale_fill_manual(values = modality_colors) +
+  scale_x_continuous(breaks = 1:10, labels=paste0('PC',1:10)) +
+  labs(
+    x        = NULL,
+    y        = "% variance explained",
+  ) +
+  theme_classic(base_size=8) +
+  theme(legend.title=element_blank(),
+        legend.key.size=unit(3,'mm'),
+        legend.position=c(.6,.8),
+        axis.text.x=element_text(angle=90, hjust=1,vjust=.5))
+```
+
+```{r data_quality_silhouette, fig.width=4, fig.height=2.5}
+library(cluster)    # silhouette()
+silhouette_events <- events #c("HRD", "chr1q21", "chr9q34_2", "chr13q14")
+
+silhouette_results <- map_dfr(names(X), function(mod) {
+  scores   <- pca.res[[mod]]$x
+  dist_mat <- dist(scores, method = "euclidean")
+
+  map_dfr(silhouette_events, function(ev) {
+    if (!(ev %in% names(meta))) return(NULL)
+
+    g    <- meta[[ev]]
+    keep <- !is.na(g) 
+    if (sum(keep) < 4) return(NULL)
+
+    g_sub <- as.integer(factor(g[keep])) # 1/2
+    if (length(unique(g_sub)) < 2) return(NULL)
+
+    d_sub <- as.dist(as.matrix(dist_mat)[keep, keep])
+    sil   <- silhouette(g_sub, d_sub)
+
+    tibble(
+      Modality   = mod,
+      Event      = ev,
+      mean_sil   = mean(sil[, "sil_width"]),
+      median_sil = median(sil[, "sil_width"]),
+      n_pos      = sum(g[keep] == 1, na.rm = TRUE),
+      n_neg      = sum(g[keep] == 0, na.rm = TRUE)
+    )
+  })
+}) %>%
+  dplyr::mutate(Modality=factor(Modality, levels=names(X)),
+                Event=factor(Event, levels=silhouette_events, labels=event_labels))#[c(1,2,3,4)]))
+
+data_quality_silhouette <- ggplot(silhouette_results,
+       aes(x = Modality, y = mean_sil,
+           colour = Event)) +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             colour = "grey50", linewidth = 0.4) +
+  geom_line(aes(group = Event), colour = "grey70",
+            linewidth = 0.4) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = event_colors) +
+  scale_shape_manual(
+    values = c(16, 17, 15, 18, 8, 3, 4, 7)[seq_along(silhouette_events)],
+    name   = "Event"
+  ) +
+  labs(
+    x        = NULL,
+    y        = "mean silhouette width",
+  ) +
+  theme_classic(base_size=8) +
+  theme(legend.key.size=unit(3,'mm'),
+        axis.text.x=element_text(angle=45, hjust=1, vjust=1),
+        legend.title=element_blank())
+```
+
+```{r Fig1, fig.width=5, fig.height=3.5, cache=FALSE}
+plot_grid(plot_grid(cohort_overview + labs(title='genomic alterations'),
+                    features_per_modality + labs(title='molecular data'), 
+                    ncol=2, align='h', axis='t', labels=c('A','B'), rel_widths=c(.65,.35)),
+          plot_grid(data_quality_pca + labs(title='', x=''), 
+                    data_quality_silhouette + labs(title=''), 
+                    ncol=2, align='h', labels=c('C','D'), rel_widths=c(.4,.6)),
+          ncol=1, rel_heights=c(.4,.6))
+```
+
+```{r FigS1, fig.width=6, fig.height=6, cache=FALSE}
+plot_grid(plot_grid(pca_plot_rna, pca_plot_macs, align='vh', ncol=1), 
+          plot_grid(pca_plot_rna_bc, pca_plot_macs_bc, align='vh', ncol=1),
+          align='vh', ncol=1, labels=c('A','B',''), rel_heights=c(.4,.4,.2))
+```
+
+# Figure 2+S2
+
+check how much each modality contributes to classification of genomic events using PLS-DA
+
+```{r plsda, fig.width=10, fig.height=2.5}
+plsda.res <- list()
+for (event in events) {
+  plsda.res[[event]] <- list()
+  for (mod in c('CNV','RNA','protein','phospho')) {
+    use <- !is.na(meta[,event])
+    plsda.res[[event]][[mod]] <- plsda(X[[mod]][use,], meta[use,event], ncomp=NCOMP, scale=TRUE)
+  }
+}
+
+plot_plsda <- function(obj, color) {
+  plist <- lapply(names(obj), 
+                  function(x) cbind(obj[[x]]$variates$X,
+                                    meta[!is.na(meta[,color]),color,drop=FALSE] %>%
+                                      dplyr::mutate_all(as.factor)) %>%
+                    ggplot(aes_string(x='comp1', y='comp2', color=color)) +
+                    geom_point() + 
+                    theme_classic(base_size=8) +
+                    stat_ellipse() +
+                    theme(legend.key.height=unit(3,'mm')) +
+                    labs(title=x,
+                         x=paste0('V1 (', signif(100*obj[[x]]$prop_expl_var$X[[1]],1),'%)'),
+                         y=paste0('V2 (', signif(100*obj[[x]]$prop_expl_var$X[[2]],1),'%)')))
+  cowplot::plot_grid(plotlist=c(lapply(plist, function(x) x + theme(legend.position='none')),
+                                list(cowplot::get_legend(plist[[1]]))), ncol=length(plist) + 1, align='vh')
+} 
+```
+
+or sparse PLS-DA using all features 
+
+```{r splsda_full, fig.width=10, fig.height=2.5}
+splsda.full <- list()
+for (event in events) {
+  splsda.full[[event]] <- list()
+  for (mod in c('CNV','RNA','protein','phospho')) {
+    use <- !is.na(meta[,event])
+    splsda.full[[event]][[mod]] <- splsda(X[[mod]][use,], meta[use,event], ncomp=NCOMP, scale=TRUE, keepX=keeps)
+  }
+}
+```
+
+or only trans features
+
+```{r splsda_trans, fig.width=10, fig.height=2.5}
+splsda.trans <- list()
+
+for (event in targets) {
+  splsda.trans[[event]] <- list()
+  for (mod in c('CNV','RNA','protein','phospho')) {
+    use <- !is.na(meta[,event])
+    features <- colnames(X[[mod]])
+    trans_features <- features[!grepl(target_regex[[event]], mod_locs[[mod]][features])]
+    splsda.trans[[event]][[mod]] <- splsda(X[[mod]][use,trans_features], meta[use,event], ncomp=NCOMP, scale=TRUE, keepX=keeps)
+  }
+}
+```
+
+evaluate performance of these models (AUROC) (this will take a while)
+
+```{r auroc_plsda}
+if (FALSE) {
+  
+  get_folds <- function(event, meta) {
+    n_pos <- sum(meta[[event]] == 1, na.rm = TRUE)
+    case_when(
+      n_pos >= 20 ~ 5L,
+      n_pos >= 7 ~ 3L,
+      TRUE        ~ NA_integer_   # skip — too few positives for reliable CV
+    )
+  }
+  
+  perf.plsda <- list()
+  perf.splsda.full <- list()
+  perf.splsda.trans <- list()
+  for (event in events) {
+    perf.plsda[[event]] <- sapply(modalities, function(mod) 
+      perf(plsda.res[[event]][[mod]], validation = "Mfold", folds = get_folds(event, meta), 
+           nrepeat = 50, auc = TRUE, progressBar = FALSE, cpus=20), simplify=FALSE, USE.NAMES = TRUE)
+    perf.splsda.full[[event]] <- sapply(modalities, function(mod)
+      perf(splsda.full[[event]][[mod]], validation = "Mfold", folds = get_folds(event, meta),
+           nrepeat = 50, auc = TRUE, progressBar = FALSE, cpus=20), simplify=FALSE, USE.NAMES = TRUE)
+  }
+  for (event in targets) {
+    perf.splsda.trans[[event]] <- sapply(modalities, function(mod)
+      perf(splsda.trans[[event]][[mod]], validation = "Mfold", folds = get_folds(event, meta),
+           nrepeat = 50, auc = TRUE, progressBar = FALSE, cpus=20), simplify=FALSE, USE.NAMES = TRUE)
+  }
+  
+  auc_df <- do.call(rbind, lapply(modalities,
+                                  function(x) do.call(rbind, c(lapply(events, function(event)
+                                    rbind(t(as.data.frame(perf.plsda[[event]][[x]]$auc)) %>%
+                                            as.data.frame() %>%
+                                            tibble::rownames_to_column('comp') %>% 
+                                            dplyr::mutate(modality=x,
+                                                          method='dense',
+                                                          event=event),
+                                          t(as.data.frame(perf.splsda.full[[event]][[x]]$auc)) %>%
+                                            as.data.frame() %>%
+                                            tibble::rownames_to_column('comp') %>% 
+                                            dplyr::mutate(modality=x,
+                                                          method='sparse (all features)',
+                                                          event=event))),
+                                    lapply(targets, function(event)
+                                      rbind(t(as.data.frame(perf.splsda.trans[[event]][[x]]$auc)) %>%
+                                              as.data.frame() %>%
+                                              tibble::rownames_to_column('comp') %>% 
+                                              dplyr::mutate(modality=x,
+                                                            method='sparse (trans features)',
+                                                            event=event)
+                                            ))))))
+  write.csv(auc_df, 'AUC_CV.csv')
+} else {
+  auc_df <- read.csv('AUC_CV.csv', row.names=1)
+}
+```
+
+plot these results
+
+```{r plot_plsda_auc, fig.width=6, fig.height=2.5}
+plot_plsda_auc <- auc_df %>%
+  dplyr::filter(method %in% c('dense','sparse (all features)'), comp=='comp2') %>%
+  dplyr::mutate(modality=factor(modality, levels=c('CNV','RNA','protein','phospho')),
+                event=factor(event, levels=events, labels=event_labels),
+                method=gsub(' .*','',method)) %>%
+  ggplot(aes(x=modality, y=AUC.mean)) + 
+  geom_point(aes(group=event, color=event),size=2) +
+  geom_errorbar(aes(group=event, color=event, ymin=AUC.mean-AUC.sd, ymax=AUC.mean+AUC.sd),width=0) +
+  geom_line(aes(group=event, color=event)) +
+  theme_classic(base_size=8) +
+  theme(strip.clip='off',
+        axis.text.x=element_text(angle=45, hjust=1, vjust=1),
+        strip.background=element_blank(),
+        legend.key.size=unit(3,'mm')) +
+  facet_wrap(~method, ncol=2) +
+  scale_color_manual(values=event_colors) +
+  coord_cartesian(ylim=c(.25,1)) +
+  labs(x=NULL,y='(s)PLS-DA AUC', color=NULL)
+```
+
+compare on- and off-target loadings of selected components for the HRD/chr1/chr9/chr13/chr17 models
+
+```{r plsda_loadings, fig.width=5, fig.height=5}
+loadings <- do.call(rbind, lapply(modalities, function(x)
+  rbind(data.frame(sapply(targets, function(y) rowSums(plsda.res[[y]][[x]]$loadings$X**2))) %>%
+          dplyr::mutate(method='dense',
+                        modality=x) %>%
+          tibble::rownames_to_column('feature'),
+        data.frame(sapply(targets, function(y) rowSums(splsda.full[[y]][[x]]$loadings$X**2))) %>%
+          dplyr::mutate(method='sparse',
+                        modality=x) %>%
+          tibble::rownames_to_column('feature')) %>%
+    dplyr::mutate(loc=mod_locs[[x]][feature]))) %>%
+  dplyr::mutate(loc=factor(loc, levels=loc.order),
+                chrom=factor(gsub('chr([0-9]*).*','\\1',loc),levels=seq(1,22))) %>%
+  gather(target, loading, targets) %>%
+  dplyr::filter(loading > 0) %>%
+  dplyr::group_by(method, target) %>%
+  dplyr::mutate(on_target=ifelse(grepl(target_regex[[unique(target)]], loc),'cis','trans')) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(modality=factor(modality, levels=modalities),
+                target=factor(target, levels=targets, labels=event_labels[1:5]))
+
+pvals <- loadings %>%
+  dplyr::group_by(target, modality, method) %>%
+  dplyr::summarise(p=ifelse(length(unique(on_target)) > 1, 
+                            wilcox.test(loading ~ on_target)$p.value,
+                            NA))
+
+n_features <- loadings %>%
+  dplyr::group_by(target, modality, method) %>%
+  dplyr::summarise(n=n(),
+                   y=min(loading))
+
+plsda_loadings <- ggplot(loadings, aes(x=method, y=loading, color=on_target)) +
+  geom_point(size=.1, position=position_jitterdodge(dodge.width=.6, jitter.width=.2, jitter.height=0),alpha=.25) +
+  geom_boxplot(outlier.size=0, position=position_dodge(width=.6), fill=NA, width=.6) +
+  theme_classic(base_size=8) + 
+  geom_text(data=pvals, aes(y=Inf,label=stars.pval(p)), color='black', size=2) +
+  facet_grid(modality~target, switch='y') +
+  theme(strip.background=element_blank(),
+        strip.placement='outside',
+        strip.clip='off',
+        axis.text.x=element_text(angle=45, hjust=1, vjust=1)) +
+  scale_color_manual(values=c('cis'='darkseagreen3','trans'='coral3')) +
+  coord_cartesian(clip='off') +
+  labs(color='',x='',y='squared loading') +
+  scale_y_log10()
+```
+
+test whether sparse models are less on-target than dense ones
+
+```{r plsda_dense_vs_sparse, fig.width=6, fig.height=2.5}
+boot_median_ci <- function(loading_norm, on_target, B=500, seed=42) {
+  set.seed(seed)
+  keep <- !is.na(loading_norm)
+  ln   <- loading_norm[keep]
+  ot   <- on_target[keep]
+  
+  empty <- list(est=NA_real_, q05=NA_real_, q95=NA_real_)
+  if (sum(ot=="cis") < 2 || sum(ot=="trans") < 2) return(empty)
+  
+  obs <- median(ln[ot=="cis"]) - median(ln[ot=="trans"])
+  
+  boot_diffs <- replicate(B, {
+    idx <- sample(length(ln), replace=TRUE)
+    ln_b <- ln[idx]; ot_b <- ot[idx]
+    if (sum(ot_b=="cis") == 0 || sum(ot_b=="trans") == 0) return(NA_real_)
+    median(ln_b[ot_b=="cis"]) - median(ln_b[ot_b=="trans"])
+  })
+  boot_diffs <- boot_diffs[!is.na(boot_diffs)]
+  if (length(boot_diffs) < 10) return(empty)
+  
+  list(est = obs,
+       q05 = unname(quantile(boot_diffs, 0.05)),
+       q95 = unname(quantile(boot_diffs, 0.95)))
+}
+
+loading_summary <- loadings %>%
+  dplyr::group_by(target, modality, method) %>%
+  dplyr::mutate(loading_norm = loading / max(loading, na.rm=TRUE),
+                loading_norm = ifelse(method=="sparse" & loading==0, NA, loading_norm)) %>%
+  dplyr::summarise(
+    boot           = list(boot_median_ci(loading_norm, on_target)),
+    n_cis_active   = sum(!is.na(loading_norm) & on_target=="cis"),
+    n_trans_active = sum(!is.na(loading_norm) & on_target=="trans"),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    est = map_dbl(boot, ~ .x[["est"]]),
+    q05 = map_dbl(boot, ~ .x[["q05"]]),
+    q95 = map_dbl(boot, ~ .x[["q95"]])
+  ) %>%
+  dplyr::select(-boot)
+
+plsda_dense_vs_sparse <- ggplot(loading_summary, 
+       aes(x=modality, y=est, colour=target, group=target)) +
+  geom_hline(yintercept=0, linetype="dashed", colour="grey60") +
+  geom_line(linewidth=0.5, position=position_dodge(0.2)) +
+  geom_pointrange(aes(ymin=q05, ymax=q95),
+                  position=position_dodge(0.2), size=0.4) +
+  scale_colour_manual(values=event_colors, 
+                      name="Model") +
+  facet_wrap(~method, nrow=1) +
+  labs(x="",
+       y="cis vs. trans loading difference") +
+  theme_classic(base_size=8) +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        strip.clip='off',
+        strip.background=element_blank(),
+        legend.title=element_blank(),
+        legend.key.size=unit(3,'mm'))
+```
+
+compare sparse models using all vs. only trans features
+
+```{r splsda_full_vs_trans, fig.width=4, fig.height=2.5}
+splsda_full_vs_trans <- auc_df %>%
+  filter(!is.na(AUC.mean), method=='sparse (trans features)', event %in% targets, comp=='comp2') %>%
+  dplyr::mutate(
+    modality    = factor(modality, levels=c('CNV','RNA','protein','phospho')),
+    feature_set = factor(gsub('sparse \\(([altrns]*) features\\)','\\1',method), levels=c('trans','all'), 
+                         labels=c('only trans features','all features')),
+    event       = factor(event, levels=targets,
+                         labels=event_labels[1:5])
+    ) %>%
+  ggplot(aes(x=modality, y=AUC.mean, colour=event)) +
+  geom_line(aes(group=event),linewidth=0.5) +
+  geom_point(size=2) +
+  facet_wrap(~method, nrow=1) +
+  geom_errorbar(aes(ymin=AUC.mean-AUC.sd, ymax=AUC.mean+AUC.sd), width=0) +
+  scale_colour_manual(values=event_colors) +
+  labs(x=NULL, y="sPLS-DA AUC", color=NULL) +
+  theme_classic(base_size=8) +
+  coord_cartesian(ylim=c(.25,1)) +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+    strip.clip='off',
+    strip.background=element_blank(),
+    legend.key.size=unit(3,'mm'),
+    legend.title=element_blank())
+```
+
+check feature overlap for the sparse models
+
+```{r splsda_feature_overlap, fig.width=3, fig.height=2.5}
+library(patchwork)
+
+feature_to_gene <- function(features, modality) {
+  switch(modality,
+         RNA     = features,                                    # already gene symbols
+         protein = features,                                    # already gene symbols
+         phospho = gsub("\\..*$", "", features),                # strip site info
+         CNV     = NULL                                         # skip
+  )
+}
+
+get_active_genes <- function(result, modality) {
+  if (is.null(result)) return(character(0))
+  loadings <- result$loadings$X
+  active   <- rownames(loadings)[rowSums(loadings^2) > 0]
+  unique(feature_to_gene(active, modality))
+}
+
+active_genes <- imap_dfr(events, function(event, i) {
+  imap_dfr(c("RNA","protein","phospho"), function(mod, j) {
+    genes <- get_active_genes(splsda.full[[event]][[mod]], mod)
+    if (length(genes) == 0) return(NULL)
+    tibble(gene=genes, event=event, modality=mod)
+  })
+}) %>%
+  dplyr::mutate(
+    event    = factor(event, levels=events, labels=event_labels),
+    modality = factor(modality, levels=c("RNA","protein","phospho"))
+  )
+
+make_upset_data <- function(event_label) {
+  df <- active_genes %>% 
+    dplyr::filter(event == event_label)
+  
+  all_genes <- unique(df$gene)
+  if (length(all_genes) == 0) return(NULL)
+  
+  # binary matrix: genes × modalities
+  mat <- df %>%
+    dplyr::mutate(present=1L) %>%
+    pivot_wider(names_from=modality, values_from=present, values_fill=0L) %>%
+    column_to_rownames("gene") %>%
+    dplyr::select(any_of(c("RNA","protein","phospho")))
+  
+  # ensure all three columns present
+  for (col in c("RNA","protein","phospho")) {
+    if (!col %in% colnames(mat)) mat[[col]] <- 0L
+  }
+  mat
+}
+
+intersection_levels <- c(
+  "RNA", "protein", "phospho",
+  "RNA+protein", "RNA+phospho", "protein+phospho",
+  "RNA+protein+phospho"
+)
+
+intersection_df <- map_dfr(event_labels, function(ev) {
+  mat <- make_upset_data(ev)
+  if (is.null(mat) || nrow(mat) == 0) return(NULL)
+  
+  mat %>%
+    rownames_to_column("gene") %>%
+    dplyr::mutate(
+      intersection = case_when(
+        RNA==1 & protein==1 & phospho==1 ~ "RNA+protein+phospho",
+        RNA==1 & protein==1 & phospho==0 ~ "RNA+protein",
+        RNA==1 & protein==0 & phospho==1 ~ "RNA+phospho",
+        RNA==0 & protein==1 & phospho==1 ~ "protein+phospho",
+        RNA==1 & protein==0 & phospho==0 ~ "RNA",
+        RNA==0 & protein==1 & phospho==0 ~ "protein",
+        RNA==0 & protein==0 & phospho==1 ~ "phospho",
+        TRUE ~ "none"
+      )
+    ) %>%
+    dplyr::count(intersection) %>%
+    dplyr::mutate(event = ev)
+}) %>%
+  dplyr::filter(intersection != "none") %>%
+  tidyr::complete(intersection, event, fill=list(n=0)) %>%
+  dplyr::mutate(
+    intersection = factor(intersection, levels=intersection_levels),
+    event        = factor(event, levels=event_labels)
+  )
+
+dot_df <- tibble(
+  intersection = factor(intersection_levels, levels=intersection_levels),
+  RNA     = c(1,0,0, 1,1,0, 1),
+  protein = c(0,1,0, 1,0,1, 1),
+  phospho = c(0,0,1, 0,1,1, 1)
+) %>%
+  pivot_longer(c(RNA,protein,phospho), 
+               names_to="modality", values_to="active") %>%
+  dplyr::mutate(modality=factor(modality, levels=c("RNA","protein","phospho")))
+
+# top: grouped bar chart
+p_bars <- ggplot(intersection_df, 
+                 aes(x=intersection, y=n, fill=event)) +
+  geom_col(position=position_dodge(0.8), width=0.7) +
+  scale_fill_manual(values=event_colors) +
+  scale_x_discrete(labels=NULL) +   # labels handled by dot matrix below
+  scale_y_continuous(expand=expansion(mult=c(0, 0.05))) +
+  labs(x=NULL, y="# active genes\nin sPLS-DA") +
+  theme_classic(base_size=8) +
+  theme(
+    axis.ticks.x   = element_blank(),
+    legend.position = "right",
+    legend.key.size = unit(3,"mm")
+  )
+
+# bottom: dot matrix showing which modalities are in each intersection
+p_dots <- ggplot(dot_df, aes(x=intersection, y=modality)) +
+  geom_line(
+    data = dot_df %>% 
+      dplyr::filter(active==1) %>%
+      dplyr::group_by(intersection) %>% 
+      dplyr::filter(n() > 1) %>%
+      dplyr::ungroup() %>%
+      # re-apply factor levels explicitly
+      dplyr::mutate(intersection = factor(intersection, levels=intersection_levels)),
+    aes(group=intersection),
+    colour="grey30", linewidth=0.8
+  ) +
+  geom_point(aes(colour=active==1), size=2) +
+  scale_colour_manual(values=c("TRUE"="grey20", "FALSE"="grey85"), guide="none") +
+  scale_x_discrete(limits=intersection_levels) +  # force ordering explicitly
+  scale_y_discrete(limits=rev) +
+  labs(x=NULL, y=NULL) +
+  theme_classic(base_size=8) +
+  theme(
+    axis.ticks.x = element_blank(),
+    axis.text.x  = element_blank(),
+    panel.grid   = element_blank()
+  )
+
+splsda_feature_overlap <- (p_bars + theme(legend.position='none')) / p_dots +
+  plot_layout(heights=c(4, 1))
+
+splsda_feature_overlap_legend <- get_legend(p_bars +guides(fill = guide_legend(nrow = 1)) + theme(legend.title=element_blank(), legend.direction='vertical'))
+```
+
+```{r Fig2, fig.width=5, fig.height=4., cache=FALSE}
+plot_grid(plot_grid(plot_plsda_auc + theme(legend.position='none'), 
+                    splsda_full_vs_trans + guides(color='none'),
+                    plsda_dense_vs_sparse + theme(legend.position='none') +labs(y='cis vs. trans\nloading difference'), 
+                    splsda_feature_overlap + theme(legend.position='none'), labels=c('A','C','B','D'), ncol=2, align='vh', rel_widths=c(.65,.345)),
+          splsda_feature_overlap_legend, ncol=1, align='vh',rel_heights=c(.9,.1))
+```
+
+run gene set enrichment on the dense model
+
+```{r plsda_gene_set_enrichment, fig.width=10, fig.height=5}
+get_ranked_genes <- function(result, modality) {
+  loadings <- result$loadings$X
+  score    <- rowSums(loadings^2)   # sum squared loadings across components
+  features <- names(sort(score, decreasing=TRUE))
+  feature_to_gene(features, modality)  # your existing mapping function
+}
+
+cerno_results <- list()
+for (event in events) {
+  for (mod in c("RNA", "protein", "phospho")) {
+    
+    fit <- plsda.res[[event]][[mod]]
+    if (is.null(fit)) next
+    
+    ranked_genes <- get_ranked_genes(fit, mod)
+    # remove duplicates (multiple phospho sites per gene) keeping highest rank
+    ranked_genes <- ranked_genes[!duplicated(ranked_genes)]
+    
+    res <- tryCatch({
+      tmodCERNOtest(
+        l        = ranked_genes,
+        mset     = tmod_db,
+        qval     = 1,       # keep all, filter later
+        order.by = "pval"      )
+    }, error = function(e) { message(e); NULL })
+    
+    if (!is.null(res) && nrow(res) > 0) {
+      cerno_results[[length(cerno_results) + 1]] <- as_tibble(res) %>%
+        mutate(event=event, modality=mod)
+    }
+  }
+}
+
+cerno_df <- bind_rows(cerno_results) %>%
+  dplyr::filter(N1 <= 200)
+
+sig_pathways_cerno <- cerno_df %>%
+  dplyr::filter(adj.P.Val < 1.e-3, AUC > .65) %>%
+  dplyr::count(Title) %>%
+  dplyr::filter(n >= 2) %>%   # significant in at least 2 comparisons
+  dplyr::pull(Title)
+
+effect_mat <- cerno_df %>%
+  dplyr::filter(Title %in% sig_pathways_cerno) %>%
+  dplyr::mutate(condition = paste(event, modality, sep="|"),
+         AUC = ifelse(is.na(AUC), 0.5, AUC)) %>%
+  dplyr::select(Title, condition, AUC) %>%
+  pivot_wider(names_from=condition, values_from=AUC, values_fill=0.5) %>%
+  column_to_rownames("Title")
+
+pathway_order <- hclust(
+  dist(effect_mat, method="euclidean"), 
+  method="ward.D2"
+)$order
+
+plot_df_cerno <- cerno_df %>%
+  dplyr::filter(Title %in% sig_pathways_cerno) %>%
+  dplyr::mutate(
+    modality  = factor(modality, levels=c("RNA","protein","phospho")),
+    event     = factor(event, levels=events, labels=event_labels),
+    log10p    = -log10(adj.P.Val),
+    Title     = factor(str_wrap(toupper(Title),60),
+                       levels=str_wrap(toupper(rownames(effect_mat)[pathway_order]),60))
+    
+  )
+
+plsda_gene_set_enrichment <- ggplot(plot_df_cerno, aes(x=modality, y=Title)) +
+  geom_point(aes(color=log10p, size=AUC)) +
+  scale_color_distiller(palette='YlOrRd', direction=1,name="-log10(FDR)", limits=c(0,30), oob=scales::squish) +
+  scale_size_continuous(name="AUC") +
+  facet_grid(. ~ event) +
+  labs(x=NULL, y=NULL) +
+  theme_minimal(base_size=8) +
+  theme(
+    axis.text.x      = element_text(angle=45, hjust=1),
+    axis.text.y      = element_text(lineheight=.8),
+    strip.background = element_blank(),
+    strip.clip       = 'off',
+    legend.key.size  = unit(3, 'mm')
+  ) +
+  coord_cartesian(clip='off')
+```
+
+```{r FigS2, fig.width=7, fig.height=8, cache=FALSE}
+plot_grid(plsda_gene_set_enrichment + theme(legend.position='bottom') + labs(title='pathway enrichment analysis of PLS-DA coefficients'), 
+          plsda_loadings + labs(title='(s)PLS-DA loadings'), 
+          ncol=1, align='vh', labels=c('A','B'), rel_heights=c(.55,.45))
+```
+
+# Figure 3+S3
+
+```{r mofa2_export, eval=FALSE}
+write.csv(X[['CNV']], 'mofa2_input/CNV_data_processed.csv')
+write.csv(X[['RNA']], 'mofa2_input/RNA_data_processed.csv')
+write.csv(X[['protein']], 'mofa2_input/protein_data_processed.csv')
+write.csv(X[['phospho']], 'mofa2_input/phospho_data_processed.csv')
+writeLines(row.names(meta)[meta$disease=='multiple.myeloma'],'mofa2_input/MM_samples.txt')
+writeLines(row.names(meta)[meta$macs_protein==1],'mofa2_input/sorted_samples.txt')
+writeLines(row.names(meta)[meta$macs_protein==0],'mofa2_input/unsorted_samples.txt')
+```
+
+```{r mofa2_import}
+UPLOAD <- "mofa2_output"
+ 
+var_exp_file       <- file.path(UPLOAD, "variance_explained.csv")
+factor_scores_file <- file.path(UPLOAD, "factor_scores.csv")
+cnv_load_file      <- file.path(UPLOAD, "weights_cnv.csv")
+rna_load_file      <- file.path(UPLOAD, "weights_rna.csv")
+prot_load_file     <- file.path(UPLOAD, "weights_protein.csv")
+phospho_load_file  <- file.path(UPLOAD, "weights_phospho.csv")
+```
+
+```{r mofa2_explained_variance, fig.width=3, fig.height=1.5}
+library(scales)
+var_exp <- read_csv(var_exp_file, show_col_types = FALSE) %>%
+  pivot_longer(-Factor, names_to = "Modality", values_to = "VarExp") %>%
+  mutate(
+    Factor   = factor(gsub('actor','',Factor), levels = paste0("F", 1:10)),
+    Modality = factor(Modality, levels = c("CNV", "RNA", "Protein", "Phospho"),
+                      labels=c('CNV','RNA','protein','phospho'))
+  )
+ 
+mofa2_explained_variance <- ggplot(var_exp,
+       aes(y = fct_rev(Modality), x = Factor, fill = VarExp)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(
+    aes(label = ifelse(VarExp >= 1.0, sprintf("%.1f", VarExp), "")),
+    size = 2, colour = "white"
+  ) +
+  scale_fill_gradientn(
+    colours = c("grey96", "#c6dbef", "#4292c6", "#08519c", "#08306b"),
+    values  = rescale(c(0, 0.5, 5, 15, 27)),
+    name    = "% variance\nexplained"
+  ) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size=8) +
+  theme(
+    panel.grid      = element_blank(),
+    legend.key.size = unit(3,'mm'),
+    axis.text.x     = element_text(angle=90, hjust=1, vjust=.5),
+    legend.position = "none"
+  )
+```
+
+```{r mofa2_associations, fig.width=3.5, fig.height=3.25}
+mofa2_scores <- read_csv(factor_scores_file, show_col_types = FALSE)
+id_col <- names(mofa2_scores)[1]
+mofa2_scores <- mofa2_scores %>% dplyr::rename(sample_id = all_of(id_col))
+factor_cols <- grep("^Factor", names(mofa2_scores), value = TRUE)
+ 
+meta_scores <- mofa2_scores %>% 
+  dplyr::left_join(meta %>% tibble::rownames_to_column('sample_id'),
+                   by = "sample_id") %>%
+  as.data.frame()
+
+binary_covs <- c("HRD",  "chr1q21", "chr9q34_2", "chr13q14", "chr17p13_1",
+                 "t_11_14", "t_14_16", "t_4_14","UBE2Q1", 'macs_protein', 'gender')
+multi_covs    <- c('disease','genetic_subgroup','iss','r_iss')
+numeric_covs  <- c('age','plasma_cells','risk_score','rna_quality','prolif_index','nfkb_index',
+                   'GEP5','ZANS5','DS30') 
+
+all_covs   <- c(binary_covs, multi_covs, numeric_covs)
+cov_type <- c(rep('binary', length(binary_covs)),
+              rep('multi', length(multi_covs)),
+              rep('numerical',length(numeric_covs)))
+
+all_covs_sorted <- c('disease','genetic_subgroup','iss','r_iss',
+                     'HRD', "chr1q21", "chr9q34_2", "chr13q14", "chr17p13_1",
+                      "t_4_14", "t_11_14", "t_14_16",
+                     'UBE2Q1','risk_score','prolif_index','nfkb_index','GEP5','ZANS5','DS30',
+                     'age','gender','plasma_cells', 'macs_protein','rna_quality')
+all_covs_labels <- c('disease type','genetic subgroup','ISS','R-ISS',
+                     event_labels,
+                     'UBE2Q1 level','risk score','proliferation index','NFkB index','GEP5','ZANS5','DS30',
+                     'age','gender','% plasma cells', 'CD138 enrichment','RNA quality')
+all_covs_groups <- setNames(c(rep('1',4),
+                              rep('2',8),
+                              rep('3',7),
+                              rep('4',5)), all_covs_sorted)
+ 
+## helpers
+rank_biserial <- function(x, g) {
+  lv  <- levels(factor(g))
+  g1  <- x[g == lv[1]]; g2 <- x[g == lv[2]]
+  n1  <- length(g1);     n2 <- length(g2)
+  U   <- wilcox.test(g1, g2, exact = FALSE)$statistic
+  as.numeric(1 - 2 * U / (n1 * n2))
+}
+ 
+eta_sq_kw <- function(x, g) {
+  n   <- sum(!is.na(x) & !is.na(g))
+  k   <- length(unique(na.omit(g)))
+  H   <- kruskal.test(x ~ factor(g))$statistic
+  max(0, as.numeric((H - k + 1) / (n - k)))
+}
+ 
+run_assoc <- function(factor_scores, covariate, type) {
+  vals <- meta_scores[[covariate]]
+  keep <- !is.na(vals) & !is.na(factor_scores)
+  x    <- factor_scores[keep]
+  g    <- vals[keep]
+  if (length(unique(g)) < 2) return(tibble(p = NA_real_, effect = NA_real_))
+ 
+  if (type=='binary') {
+    wt  <- wilcox.test(x ~ factor(g), exact = FALSE)
+    eff <- rank_biserial(x, g)
+    tibble(p = wt$p.value, effect = eff)
+  } else if (type == 'multi') {
+    kt  <- kruskal.test(x ~ factor(g))
+    eff <- eta_sq_kw(x, g)
+    tibble(p = kt$p.value, effect = eff)
+  } else {
+    sp <- cor.test(x, as.numeric(g), method = "spearman")
+    tibble(p = sp$p.value, effect = sp$estimate)  # estimate = rho 
+  }
+}
+ 
+assoc_res <- map2_dfr(all_covs, cov_type, function(cov, type) {
+  map_dfr(factor_cols, function(fac) {
+    res <- tryCatch(
+      run_assoc(meta_scores[[fac]], cov, type),
+      error = function(e) tibble(p = NA_real_, effect = NA_real_)
+    )
+    tibble(Factor = fac, Covariate = cov, p = res$p, effect = res$effect)
+  })
+}) %>%
+  dplyr::group_by(Covariate) %>%
+  dplyr::mutate(q = p.adjust(p, method = "BH")) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    neglog10p = -log10(pmax(p, 1e-10)),
+    Factor    = factor(gsub('actor','',Factor), levels = paste0("F", 1:10)),
+    Covariate = factor(Covariate, levels = all_covs_sorted, labels=all_covs_labels),
+    group     = all_covs_groups[Covariate],
+    sig_label = case_when(
+      q < 0.001 ~ "***", q < 0.01 ~ "**", q < 0.05 ~ "*", TRUE ~ ""
+    )
+  )
+
+mofa2_associations <- ggplot(assoc_res, 
+       aes(y = fct_rev(Covariate), x = Factor, fill = effect)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = sig_label), size = 2., vjust = 0.8,
+            colour = "white") +
+  scale_fill_gradient2(low='darkorchid3',high='forestgreen',midpoint=0, mid='gray80') +
+  facet_grid(group~., scales='free', space='free') +
+  labs(x        = NULL, y = NULL) +
+  theme_minimal(base_size=8) +
+  theme(
+    strip.text    = element_blank(),
+    panel.grid    = element_blank(),
+    legend.key.size = unit(3,'mm'),
+    axis.text.x   = element_text(angle = 90, hjust = 1, vjust=.5),
+  )
+```
+
+```{r mofa2_tmod, fig.width=8, fig.height=8}
+load_mofa_loadings <- function(path, prefix) {
+  if (!file.exists(path)) { message("  [SKIP] not found: ", basename(path)); return(NULL) }
+  d        <- read_csv(path, show_col_types = FALSE)
+  gene_col <- names(d)[1]
+  d        <- d %>% dplyr::rename(feature = all_of(gene_col))
+  fac_cols <- grep("^Factor", names(d), value = TRUE)
+
+  d$gene <- sub(paste0("^", prefix, "_"), "", d$feature)
+
+  d 
+}
+
+clean_phospho_loads <- function(d) {
+  d$gene <- sub("\\..*$", "", d$gene)
+  fac_cols <- grep("^Factor", names(d), value = TRUE)
+
+  d %>%
+    dplyr::mutate(mean_abs = rowMeans(across(all_of(fac_cols), abs))) %>%
+    dplyr::group_by(gene) %>%
+    dplyr::slice_max(mean_abs, n = 1, with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(gene, all_of(fac_cols))
+}
+
+mofa_loads <- list(
+  CNV     = load_mofa_loadings(cnv_load_file,     "CNV"),
+  RNA     = load_mofa_loadings(rna_load_file,     "RNA"),
+  protein = load_mofa_loadings(prot_load_file,    "protein"),
+  phospho = load_mofa_loadings(phospho_load_file, "phospho")
+)
+mofa_loads <- Filter(Negate(is.null), mofa_loads)
+
+mofa_factors <- paste0("Factor", 1:10)
+mofa_cerno_results <- list()
+for (fac in mofa_factors) {
+  for (mod in c('RNA','protein','phospho')) {
+
+    d <- mofa_loads[[mod]]
+    if (mod=='phospho') d <- clean_phospho_loads(d)
+
+    if (!(fac %in% names(d))) next
+
+    ranked_genes <- d %>%
+      dplyr::select(gene, loading = all_of(fac)) %>%
+      dplyr::arrange(desc(loading)) %>%
+      dplyr::pull(gene)
+
+    # remove duplicates (safety net for phospho)
+    ranked_genes <- ranked_genes[!duplicated(ranked_genes)]
+
+    res <- tryCatch(
+      tmodCERNOtest(l = ranked_genes, mset = tmod_db,
+                    qval = 1, order.by = "pval"),
+      error = function(e) { message(fac, " ", mod, ": ", e$message); NULL }
+    )
+
+    if (!is.null(res) && nrow(res) > 0) {
+      mofa_cerno_results[[length(mofa_cerno_results) + 1]] <- as_tibble(res) %>%
+        mutate(factor = fac, modality = mod)
+    }
+  }
+}
+
+mofa_cerno_df <- bind_rows(mofa_cerno_results) 
+
+sig_pathways_mofa <- mofa_cerno_df %>%
+  dplyr::filter(adj.P.Val < 1e-5, AUC > 0.7) %>%
+  dplyr::count(Title) %>%
+  dplyr::filter(n >= 2) %>%
+  dplyr::pull(Title)
+
+effect_mat_mofa <- mofa_cerno_df %>%
+  dplyr::filter(Title %in% sig_pathways_mofa) %>%
+  dplyr::mutate(
+    condition = paste(factor, modality, sep = "|"),
+    AUC       = ifelse(is.na(AUC), 0.5, AUC)
+  ) %>%
+  dplyr::select(Title, condition, AUC) %>%
+  pivot_wider(names_from = condition, values_from = AUC, values_fill = 0.5) %>%
+  column_to_rownames("Title")
+
+pathway_order_mofa <- hclust(
+  dist(effect_mat_mofa, method = "euclidean"),
+  method = "ward.D2"
+)$order
+
+factor_labels <- setNames(
+  paste0("F", 1:10),
+  paste0("Factor", 1:10)
+)
+
+plot_df_mofa <- mofa_cerno_df %>%
+  dplyr::filter(Title %in% sig_pathways_mofa) %>%
+  mutate(
+    modality = factor(modality, levels = c("RNA", "protein", "phospho")),
+    factor   = factor(factor,   levels = mofa_factors, labels = factor_labels),
+    log10p   = -log10(adj.P.Val),
+    Title    = factor(
+      str_wrap(toupper(Title), 60),
+      levels = str_wrap(toupper(rownames(effect_mat_mofa)[pathway_order_mofa]), 60)
+    )
+  )
+
+mofa2_tmod <- ggplot(plot_df_mofa, aes(x = factor, y = Title)) +
+  geom_point(aes(color = log10p, size = AUC)) +
+  scale_color_distiller(palette='YlOrRd', direction=1,name="-log10(FDR)", limits=c(0,30), oob=scales::squish) +
+  scale_size_continuous(name="AUC") +
+  facet_grid(. ~ modality) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size=8) +
+  theme(
+    axis.text.x        = element_text(angle = 90, hjust = 1, vjust=.5, size = 8),
+    axis.text.y        = element_text(size = 7),
+    strip.background   = element_blank(),
+    strip.clip         = "off",
+    legend.key.size    = unit(3, "mm"),
+  ) +
+  coord_cartesian(clip = "off")
+```
+
+test prognostic value of MOFA2 factors
+
+```{r mofa2_survival, fig.width=5, fig.height=2.5}
+mofa2_survival_df <- rbind(
+  data.frame(t(sapply(c(factor_cols,'risk_score'), function(fc) {
+    score_z <- scale(meta_scores[, fc])
+    s <- summary(coxph(Surv(meta_scores$pfs_in_days, meta_scores$pfs) ~ meta_scores[,'r_iss'] + score_z))
+    c(s$coefficients['score_z', c('coef','se(coef)','z','Pr(>|z|)')],
+      lower = s$conf.int['score_z', 'lower .95'],
+      upper = s$conf.int['score_z', 'upper .95'],
+      C     = s$concordance['C'],
+      C_se  = s$concordance['se(C)'])}))) %>%
+    setNames(c('coef','se_coef','z','pval', 'lower','upper', 'C','C_se')) %>%
+    dplyr::mutate(test = 'PFS') %>%
+    tibble::rownames_to_column('score'),
+  data.frame(t(sapply(c(factor_cols,'risk_score'), function(fc) {
+    score_z <- scale(meta_scores[, fc])
+    s <- summary(coxph(Surv(meta_scores$os_in_days, meta_scores$os) ~ meta_scores[,'r_iss'] + score_z))
+    c(s$coefficients['score_z', c('coef','se(coef)','z','Pr(>|z|)')],
+      lower = s$conf.int['score_z', 'lower .95'],
+      upper = s$conf.int['score_z', 'upper .95'],
+      C     = s$concordance['C'],
+      C_se  = s$concordance['se(C)'])}))) %>%
+    setNames(c('coef','se_coef','z','pval', 'lower','upper','C','C_se')) %>%
+    dplyr::mutate(test='OS') %>%
+    tibble::rownames_to_column('score')) %>%
+  dplyr::mutate(padj= p.adjust(pval,method='BH'))
+
+mofa2_survival <- ggplot(mofa2_survival_df %>% 
+                           dplyr::filter(!grepl('risk', score)) %>%
+                           dplyr::mutate(score=gsub('risk_','risk ',score),
+                                         score=gsub('actor','',score),
+                                         score=factor(score, levels=c(paste0('F',1:10),'risk score')),
+                                         sig = ifelse(padj < .05, 'sig','n.s.')),
+                         aes(x=exp(coef), 
+                             xmin=lower,
+                             xmax=upper,
+                             y=fct_rev(score),
+                             color=sig)) +
+  geom_vline(xintercept=c(.5,1,2,3), linetype='dashed', color='gray', linewidth=.25) +
+  geom_point(pch=15) +
+  geom_errorbarh(height=0) +
+  geom_text(aes(label=stars.pval(padj)),nudge_y=.1) +
+  theme_classic(base_size=8) +
+  labs(x='Hazard ratio',y=NULL) +
+  scale_color_manual(values=c('gray30','firebrick'), guide=FALSE) +
+  facet_grid(.~test, scales='free',space='free', switch='y') +
+  scale_x_log10(breaks=c(.5,1,2,3)) +
+  theme(strip.background=element_blank(),
+        strip.placement='outside')
+```
+
+```{r Fig3, fig.width=5, fig.height=3.5, cache=FALSE}
+plot_grid(plot_grid(mofa2_explained_variance + labs(title='explained variance'),
+                    mofa2_survival + labs(title='survival'),
+                    align='vh', ncol=1, labels=c('A','C'), 
+                    rel_heights=c(.35,.65)),
+          mofa2_associations + labs(title='clinical associations') + theme(legend.position='bottom', legend.key.width=unit(5,'mm')), 
+          align='vh', ncol=2, labels=c('','B'))
+```
+
+```{r FigS3, fig.width=7, fig.height=7, cache=FALSE}
+mofa2_tmod + theme(legend.position='bottom', axis.text.y=element_text(lineheight=.8))
+```
+
+# Figure 4 + S4
+
+inspect factor loadings for F6
+
+```{r mofa2_F6_loadings, fig.width=6, fig.height=4.5}
+plots <- list()
+for (mod in c("CNV","RNA","protein","phospho")) {
+  top10 <- mofa_loads[[mod]][rev(order(mofa_loads[[mod]]$Factor6))[1:10],][['gene']]
+  bot10 <- mofa_loads[[mod]][order(mofa_loads[[mod]]$Factor6)[1:10],][['gene']]
+  print(paste0(mod, ': top10=', paste0(top10,collapse=', '), ', bot10=', paste0(bot10,collapse=', ')))
+  df <- mofa_loads[[mod]] %>%
+    dplyr::mutate(label=ifelse(gene %in% c(top10, bot10), gene, NA),
+                  r6=rank(Factor6))
+  
+  n_genes <- nrow(df)
+  left_x  <- .25*n_genes 
+  right_x <- .75*n_genes
+  
+  plots[[mod]] <- ggplot(df, aes(x = r6, y = Factor6)) +
+    geom_point(size = .1) +
+    geom_text_repel(
+      aes(label     = label),
+      nudge_x       = ifelse(df$Factor6 > 0,
+                             left_x  - df$r6,   # pull to fixed left column
+                             right_x - df$r6),  # pull to fixed right column
+      hjust         = ifelse(df$Factor6 > 0, 1, 0),
+      direction     = "y",        # only repel vertically
+      force         = 3,        # light vertical force is enough
+      force_x       = 0,
+      segment.alpha = 0.5,
+      segment.size  = 0.25,
+      size          = 1.75,
+      bg.color      = "white",
+      bg.r          = 0.15,
+      max.overlaps  = Inf         # don't drop any labels
+    ) +
+    scale_x_continuous(
+      expand = expansion(add = c(n_genes * 0.1, n_genes * 0.1))  # make room for label columns
+    ) +
+    theme_classic(base_size=8) +
+    labs(x = "rank", y = "F6 loading", title = mod)
+}
+
+mofa2_factor_loadings <- plot_grid(plotlist=plots, ncol=2)
+```
+
+Kaplan-Meier plots for factor6
+
+```{r mofa2_kaplan_meier, fig.width=3, fig.height=2.5}
+meta_scores$F6 <- ifelse(meta_scores$Factor6 > median(meta_scores$Factor6), 'F6 high','F6 low')
+F6_level_colors <- c('F6 high'='firebrick','F6 low'='forestgreen')
+risk_level_colors <- c('risk high'='#CC8888','risk low'='#88CC88')
+
+mofa2_kaplan_meier_pfs <- survfit2(Surv(pfs_in_days, pfs) ~ F6, data = meta_scores) %>% 
+  ggsurvfit() +
+  add_pvalue(location="annotation", x=2200, size=2) +
+  labs(
+    x = "days",
+    y = "PFS",
+  ) &
+  scale_color_manual(values=F6_level_colors)  &
+  theme_classic(base_size=8) &
+  theme(legend.position=c(.25,.15),
+        legend.background=element_blank(),
+        legend.key.size=unit(3,'mm')) 
+ 
+mofa2_kaplan_meier_os <- survfit2(Surv(os_in_days, os) ~ F6, data = meta_scores) %>% 
+  ggsurvfit() +
+  add_pvalue(location="annotation", x=2200, size=2) +
+  labs(
+    x = "days",
+    y = "OS",
+  ) &
+  scale_color_manual(values=F6_level_colors)  &
+  theme_classic(base_size=8) &
+  theme(legend.position=c(.25,.15),
+        legend.background=element_blank(),
+        legend.key.size=unit(3,'mm')) 
+```
+
+```{r mofa2_nfactors_variance, fig.width=3., fig.height=1.5}
+n_factors <- c(2,3,5,7,10,12,15,20,25,30,40,50)
+mofa2_explained_variance <- lapply(n_factors,
+                                   function(n) read.csv(paste0('mofa2_output/variance_explained_n',n,'.csv'),
+                                                        header=1,row.names=1) %>% 
+                                     gather(modality, variance) %>% 
+                                     dplyr::mutate(n_factors=n)) %>%
+  do.call(rbind, .)
+
+mofa2_nfactors_variance <- mofa2_explained_variance %>%
+  dplyr::group_by(n_factors, modality) %>%
+  dplyr::summarise(tot_var=sum(variance)) %>%
+  dplyr::mutate(modality=factor(ifelse(modality %in% c('Protein','Phospho'), tolower(modality),modality),
+                                levels=names(modality_colors))) %>%
+  ggplot(aes(n_factors, y=tot_var, color=modality)) + 
+  geom_point() + 
+  geom_line() + 
+  theme_classic(base_size=8) + 
+  scale_y_continuous(limits=c(0,85)) +
+  scale_color_manual(values=modality_colors) +
+  labs(x='# factors', y='% expl. variance', color=NULL) +
+  theme(legend.position=c(.8,.26),
+        legend.key.size=unit(3,'mm'),
+        legend.background=element_blank())
+  
+```
+
+which factors are correlated to Factor6?
+
+```{r mofa2_nfactors_correlations, fig.width=3., fig.height=1.5}
+mofa2_factor_scores <- lapply(n_factors, 
+                             function(n) read.csv(paste0('mofa2_output/factor_scores_n',n,'.csv'),
+                                                  header=1,row.names=1) %>% 
+                               tibble::rownames_to_column('sample_id')  %>%
+                               gather(factor, score, -sample_id) %>% 
+                               dplyr::mutate(n_factors=n)) %>%
+  do.call(rbind, .) 
+
+mofa2_factor_corrs <- mofa2_factor_scores %>%
+  dplyr::left_join(mofa2_scores %>% dplyr::select(sample_id, Factor6), by='sample_id') %>%
+  dplyr::group_by(factor, n_factors) %>%
+  dplyr::summarise(R2=cor(score, Factor6,method='pearson')**2) %>%
+  dplyr::group_by(n_factors) %>%
+  dplyr::mutate(best=ifelse(factor==factor[which.max(R2)],'best','other')) 
+
+jitterpos <- position_jitter(width = 0.5, seed = 42)
+
+mofa2_nfactors_corr <- ggplot(mofa2_factor_corrs, aes(x=n_factors, y=R2)) +
+  geom_point(aes(color=best,size=best),position=jitterpos) +
+  theme_classic(base_size=8) +
+  scale_color_manual(values=c('best'='forestgreen','other'='gray50')) +
+  scale_size_manual(values=c('best'=2, 'other'=1)) +
+  labs(x='# factors', y='R2 with Factor6') +
+  scale_y_continuous(limits=c(0,1)) +
+  theme(legend.position='none')
+```
+
+```{r mofa2_nfactors_survival, fig.width=3, fig.height=1.5}
+mofa2_nfactors_survival <- mofa2_factor_scores %>%
+  dplyr::left_join(
+    meta %>% tibble::rownames_to_column('sample_id') %>% 
+      dplyr::select(pfs_in_days, pfs, sample_id, r_iss),
+    by = 'sample_id'
+  ) %>%
+  dplyr::group_by(factor, n_factors) %>%
+  dplyr::group_modify(~ {
+    df <- .x 
+    
+    tryCatch({
+      df$score_z <- scale(df$score)[, 1]
+      s <- summary(coxph(Surv(pfs_in_days, pfs) ~ r_iss + score_z, data = df))
+      
+      tibble::tibble(
+        coef  = s$coefficients['score_z', 'coef'],
+        se    = s$coefficients['score_z', 'se(coef)'],
+        z     = s$coefficients['score_z', 'z'],
+        pval  = s$coefficients['score_z', 'Pr(>|z|)'],
+        lower = s$conf.int['score_z', 'lower .95'],
+        upper = s$conf.int['score_z', 'upper .95']
+      )
+    }, error = function(e) {
+      tibble::tibble(coef = NA, se = NA, z = NA, pval = NA, lower = NA, upper = NA)
+    })
+  }) %>%
+  dplyr::ungroup() %>%
+  dplyr::left_join(mofa2_factor_corrs, by=c('factor','n_factors')) %>%
+  ggplot(aes(x=n_factors, y=exp(coef), color=best,size=best)) +
+  geom_point(position=jitterpos) +
+  geom_errorbar(aes(ymin=lower,ymax=upper),position=jitterpos, width=0, linewidth=.25) +
+  theme_classic(base_size=8) +
+  scale_y_log10(limits=c(.4, 2.5)) +
+  scale_color_manual(values=c('best'='forestgreen','other'='gray50')) +
+  scale_size_manual(values=c('best'=2, 'other'=1)) +
+  labs(x='# factors', y='PFS HR') +
+  theme(legend.position='none')
+```
+
+
+```{r mofa2_subsets_variance, fig.width=1.5, fig.height=1.5}
+subsets <- c('MM','sorted','unsorted')
+mofa2_explained_variance <- lapply(subsets,
+                                   function(ss) read.csv(paste0('mofa2_output/variance_explained_',
+                                                                if (ss=='all') 'n10'
+                                                                else paste0(ss,'_n10'),'.csv'),
+                                                        header=1,row.names=1) %>%
+                                     gather(modality, variance) %>%
+                                     dplyr::mutate(subset=ss)) %>%
+  do.call(rbind, .)
+
+mofa2_subsets_variance <- mofa2_explained_variance %>%
+  dplyr::group_by(subset, modality) %>%
+  dplyr::summarise(tot_var=sum(variance)) %>%
+  dplyr::mutate(modality=factor(ifelse(modality %in% c('Protein','Phospho'), tolower(modality),modality),
+                                levels=names(modality_colors)),
+                subset=factor(subset, levels=subsets)) %>%
+  ggplot(aes(subset, y=tot_var, color=modality)) +
+  geom_point() +
+  geom_line() +
+  theme_classic(base_size=8) +
+  scale_y_continuous(limits=c(0,85)) +
+  scale_color_manual(values=modality_colors) +
+  labs(x='samples', y=NULL, color=NULL) +
+  theme(legend.position='none')
+
+```
+
+```{r mofa2_subsets_correlations, fig.width=3., fig.height=1.5}
+mofa2_factor_scores <- lapply(subsets,
+                              function(ss) read.csv(paste0('mofa2_output/factor_scores_',
+                                                           if (ss=='all') 'n10'
+                                                           else paste0(ss,'_n10'),'.csv'),
+                                                   header=1,row.names=1) %>%
+                                tibble::rownames_to_column('sample_id')  %>%
+                                gather(factor, score, -sample_id) %>%
+                                dplyr::mutate(subset=ss)) %>%
+  do.call(rbind, .)
+
+mofa2_factor_corrs <- mofa2_factor_scores %>%
+  dplyr::left_join(mofa2_scores %>% dplyr::select(sample_id, Factor6), by='sample_id') %>%
+  dplyr::group_by(factor, subset) %>%
+  dplyr::summarise(R2=cor(score, Factor6,method='pearson')**2) %>%
+  dplyr::group_by(subset) %>%
+  dplyr::mutate(best=ifelse(factor==factor[which.max(R2)],'best','other'),
+                subset=factor(subset, levels=subsets))
+
+jitterpos <- position_jitter(width = 0.2, seed = 42)
+
+mofa2_subsets_corr <- ggplot(mofa2_factor_corrs, aes(x=subset, y=R2)) +
+  geom_point(aes(color=best,size=best),position=jitterpos) +
+  theme_classic(base_size=8) +
+  scale_color_manual(values=c('best'='forestgreen','other'='gray50')) +
+  scale_size_manual(values=c('best'=2, 'other'=1)) +
+  scale_y_continuous(limits=c(0,1)) +
+  labs(x='samples', y=NULL) +
+  theme(legend.position='none')
+```
+
+```{r mofa2_subsets_survival, fig.width=3, fig.height=1.5}
+mofa2_subsets_survival <- mofa2_factor_scores %>%
+  dplyr::left_join(
+    meta %>% tibble::rownames_to_column('sample_id') %>%
+      dplyr::select(pfs_in_days, pfs, sample_id, r_iss),
+    by = 'sample_id'
+  ) %>%
+  dplyr::group_by(factor, subset) %>%
+  dplyr::group_modify(~ {
+    df <- .x
+
+    tryCatch({
+      df$score_z <- scale(df$score)[, 1]
+      s <- summary(coxph(Surv(pfs_in_days, pfs) ~ r_iss + score_z, data = df))
+
+      tibble::tibble(
+        coef  = s$coefficients['score_z', 'coef'],
+        se    = s$coefficients['score_z', 'se(coef)'],
+        z     = s$coefficients['score_z', 'z'],
+        pval  = s$coefficients['score_z', 'Pr(>|z|)'],
+        lower = s$conf.int['score_z', 'lower .95'],
+        upper = s$conf.int['score_z', 'upper .95']
+      )
+    }, error = function(e) {
+      tibble::tibble(coef = NA, se = NA, z = NA, pval = NA, lower = NA, upper = NA)
+    })
+  }) %>%
+  dplyr::ungroup() %>%
+  dplyr::left_join(mofa2_factor_corrs, by=c('factor','subset')) %>%
+  dplyr::mutate(subset=factor(subset, levels=subsets)) %>%
+  ggplot(aes(x=subset, y=exp(coef), color=best,size=best)) +
+  geom_point(position=jitterpos) +
+  geom_errorbar(aes(ymin=lower,ymax=upper),position=jitterpos, width=0, linewidth=.25) +
+  scale_y_log10(limits=c(.4, 2.5)) +
+  theme_classic(base_size=8) +
+  scale_color_manual(values=c('best'='forestgreen','other'='gray50')) +
+  scale_size_manual(values=c('best'=2, 'other'=1)) +
+  labs(x='samples', y=NULL) +
+  theme(legend.position='none')
+```
+
+
+```{r Fig4, fig.width=6, fig.height=4, cache=FALSE}
+plot_grid(plot_grid(mofa2_kaplan_meier_os, mofa2_kaplan_meier_pfs, ncol=1, labels=c('A','B'), label_x=-.02),
+          mofa2_factor_loadings, 
+          align='vh',ncol=2, labels=c('','C'), rel_widths=c(.33,.67))
+```
+
+```{r FigS4, fig.width=4.5, fig.height=4.5, cache=FALSE}
+plot_grid(mofa2_nfactors_variance, mofa2_subsets_variance,
+          mofa2_nfactors_corr, mofa2_subsets_corr,
+          mofa2_nfactors_survival, mofa2_subsets_survival, 
+          ncol=2, align='vh', labels=c('A','B','C','D','E','F'),
+          label_x=-.02, label_y=1.02, rel_widths=c(.6,.4))
+```
+
+# Figure 5+S5
+
+define uni-modal proxies for Factor6
+
+```{r mofa2_factor6_proxy, fig.width=2.5, fig.height=2.}
+library(glmnet)
+
+fit_proxy <- function(expr_mat,        # features × samples matrix
+                      factor_scores,   # named vector, Factor6 per sample
+                      modality_label,
+                      n_features_grid = c(10, 20, 50, 100, 200),
+                      nfolds = 5,
+                      nrep   = 20) {
+
+  ## align samples
+  common   <- intersect(names(factor_scores), colnames(expr_mat))
+
+  y <- factor_scores[common]
+  X <- t(expr_mat[, common])   # samples × features for glmnet
+  X <- scale(X)                # centre + scale features
+  ## remove zero-variance features (after scaling these are NaN columns)
+  valid <- apply(X, 2, function(x) !any(is.nan(x)))
+  X     <- X[, valid]
+
+  full_fit <- glmnet(X, y, alpha = 0.5, standardize = FALSE)
+
+  set.seed(42)
+  cv_fits <- lapply(seq_len(nrep), function(i)
+    cv.glmnet(X, y, alpha = 0.5, nfolds = nfolds,
+              standardize = FALSE, keep = TRUE))   # already scaled
+
+  ## average lambda sequence — use lambda that minimises mean CV error
+  lambda_min_avg <- mean(sapply(cv_fits, function(f) f$lambda.min))
+
+  ## ── 2. scan feature counts: for each target n, find lambda giving ~n features
+  results <- map_dfr(n_features_grid, function(n_target) {
+
+    ## find lambda on full-data fit that gives closest to n_target non-zero coefs
+    n_nonzero <- colSums(full_fit$beta != 0)
+    ## find lambda where n_nonzero is closest to target
+    idx       <- which.min(abs(n_nonzero - n_target))
+    lam       <- full_fit$lambda[idx]
+    actual_n  <- n_nonzero[idx]
+
+    ## refit at that lambda
+    coefs     <- coef(full_fit, s = lam)
+    feat_names <- rownames(coefs)[coefs[,1] != 0 & rownames(coefs) != "(Intercept)"]
+
+    ## out-of-fold R² across CV repeats at this lambda
+    cv_r2_vals <- sapply(cv_fits, function(f) {
+      lidx <- which.min(abs(f$lambda - lam))
+      pred <- f$fit.preval[, lidx]
+      1 - sum((y - pred)^2) / sum((y - mean(y))^2)
+    })
+    
+    mean_r2 <- mean(cv_r2_vals)
+    sd_r2 <- sd(cv_r2_vals)
+
+    tibble(
+      modality    = modality_label,
+      n_target    = n_target,
+      n_actual    = actual_n,
+      lambda      = lam,
+      mean_r2     = mean_r2,
+      sd_r2       = sd_r2,
+      features    = list(feat_names),
+      coef_vec    = list(setNames(as.numeric(coefs[feat_names,1]), feat_names)),
+      glmnet_fit  = list(full_fit),
+      lambda_used = lam
+    )
+  })
+
+  results
+}
+
+factor6_latent <- setNames(
+  mofa2_scores[["Factor6"]],   # adjust to your object structure
+  mofa2_scores[["sample_id"]]
+)
+
+f6_cnv_proxy     <- fit_proxy(t(X[['CNV']]),     factor6_latent, "CNV",
+                           n_features_grid = c(10, 20, 50, 100, 200))
+f6_rna_proxy     <- fit_proxy(t(X[['RNA']]),     factor6_latent, "RNA",
+                           n_features_grid = c(10, 20, 50, 100, 200))
+f6_protein_proxy <- fit_proxy(t(X[['protein']]), factor6_latent, "protein",
+                           n_features_grid = c(10, 20, 50, 100, 200))
+
+f6_phospho_proxy <- fit_proxy(t(X[['phospho']]), factor6_latent, "phospho",
+                              n_features_grid = c(10, 20, 50, 100, 200))
+
+f6_combined_proxy  <- bind_rows(f6_cnv_proxy, f6_rna_proxy, f6_protein_proxy, f6_phospho_proxy)
+
+mofa2_factor6_proxy <- f6_combined_proxy %>%
+  ggplot(aes(x = n_actual, y = mean_r2,
+             colour = modality)) +
+  geom_line(linewidth = 0.5) +
+  geom_point(size = .5) +
+  geom_errorbar(aes(ymin=mean_r2-sd_r2, ymax=mean_r2+sd_r2), width=0)  +
+  scale_colour_manual(values = modality_colors) +
+  scale_x_log10() +
+  labs(x     = "# features",
+       y     = "cross-validation R2",
+       title = 'uni-modal proxy for F6') +
+  theme_classic(base_size=8) +
+  theme(legend.position = c(.2,.8),
+        legend.key.size=unit(3,'mm'),
+        legend.title  = element_blank(),
+        legend.background = element_blank())
+```
+
+evaluate survival prognostic power for these f6 proxy scores and compare to the full version
+
+```{r mofa2_factor6_proxy_survival, fig.width=3.5, fig.height=2.5}
+eval_proxy_survival <- function(proxy_res, expr_mat, clin_df) {
+  map_dfr(seq_len(nrow(proxy_res)), function(i) {
+    row      <- proxy_res[i, ]
+    fit      <- row$glmnet_fit[[1]]
+    lam      <- row$lambda_used
+    common   <- intersect(clin_df$sample_id, colnames(expr_mat))
+    X_new    <- t(scale(t(expr_mat[, common])))
+    score    <- predict(fit, newx = t(X_new), s = lam)[,1]
+
+    tmp <- clin_df %>%
+      dplyr::filter(sample_id %in% common) %>%
+      mutate(proxy_z = scale(score[sample_id])[,1])
+
+    fit_pfs <- coxph(Surv(pfs_in_days, pfs) ~ proxy_z + r_iss, data = tmp)
+    fit_os  <- coxph(Surv(os_in_days,  os)  ~ proxy_z + r_iss, data = tmp)
+
+    extract_p <- function(fit) {
+      if (is.null(fit)) return(c(coef=NA, p=NA, lower=NA, upper=NA, C=NA, C_se=NA))
+      s <- summary(fit)
+      c(coef  = s$coefficients['proxy_z',"coef"],
+        p     = s$coefficients["proxy_z","Pr(>|z|)"],
+        lower = s$conf.int["proxy_z","lower .95"],
+        upper = s$conf.int["proxy_z","upper .95"],
+        C     = s$concordance[["C"]],
+        C_se  = s$concordance[["se(C)"]]
+      )
+    }
+    
+    pfs_res <- extract_p(fit_pfs)
+    os_res  <- extract_p(fit_os)
+
+    tibble(modality = rep(row$modality,2),
+           n_actual = rep(row$n_actual,2),
+           coef = c(pfs_res["coef"], os_res["coef"]),
+           lower = c(pfs_res["lower"], os_res["lower"]),
+           upper = c(pfs_res["upper"], os_res["upper"]),
+           p = c(pfs_res["p"],os_res["p"]),
+           C = c(pfs_res["C"],os_res["C"]),
+           C_se = c(pfs_res["C_se"], os_res["C_se"]),
+           test = c('PFS','OS'))
+  })
+}
+
+f6_surv_res <- bind_rows(
+  eval_proxy_survival(f6_cnv_proxy,     t(X[['CNV']]),     meta %>% tibble::rownames_to_column('sample_id')),
+  eval_proxy_survival(f6_rna_proxy,     t(X[['RNA']]),     meta %>% tibble::rownames_to_column('sample_id')),
+  eval_proxy_survival(f6_protein_proxy, t(X[['protein']]), meta %>% tibble::rownames_to_column('sample_id')),
+  eval_proxy_survival(f6_phospho_proxy, t(X[['phospho']]), meta %>% tibble::rownames_to_column('sample_id')),
+)
+
+f6_rna10_proxy_coefs     <- f6_rna_proxy[f6_rna_proxy$n_actual==11, 'coef_vec'][[1]][[1]]
+f6_rna100_proxy_coefs     <- f6_rna_proxy[f6_rna_proxy$n_actual==99, 'coef_vec'][[1]][[1]]
+f6_protein10_proxy_coefs <- f6_protein_proxy[f6_protein_proxy$n_actual==10, 'coef_vec'][[1]][[1]]
+f6_protein100_proxy_coefs <- f6_protein_proxy[f6_protein_proxy$n_actual==99, 'coef_vec'][[1]][[1]]
+f6_phospho10_proxy_coefs <- f6_phospho_proxy[f6_phospho_proxy$n_actual==10, 'coef_vec'][[1]][[1]]
+f6_phospho100_proxy_coefs <- f6_phospho_proxy[f6_phospho_proxy$n_actual==100, 'coef_vec'][[1]][[1]]
+
+mofa2_factor6_proxy_survival <- ggplot(f6_surv_res %>%
+                                         dplyr::mutate(padj = p.adjust(p, method='BH')),
+                                       aes(y=exp(coef), 
+                                           ymin=lower,
+                                           ymax=upper,
+                                           x=n_actual,
+           color=modality)) +
+  geom_hline(yintercept=c(.5,1,2,3), linetype='dashed', color='gray', width=.25) +
+  geom_hline(data = mofa2_survival_df %>% 
+               dplyr::filter(score == 'Factor6') %>%
+               mutate(modality = 'F6',   
+                      n_actual = NA_real_),
+             aes(yintercept = exp(coef), color = 'F6'),
+             linetype = 'solid') +  
+  geom_point(pch=15) +
+  geom_line() +
+  geom_errorbar(width=0) +
+  theme_classic(base_size=8) +
+  labs(y='Hazard ratio',x='# features', color=NULL) +
+  scale_color_manual(
+    values = c(modality_colors, 'F6' = 'orchid3'),
+    breaks = c("CNV", "RNA", "protein", "phospho", "F6"),
+  ) +
+  guides(color = guide_legend(override.aes = list(pch = c(rep(15, 4), NA)))) +
+  facet_grid(.~test, scales='free',space='free', switch='y') +
+  scale_y_log10(breaks=c(.5,1,2,3)) +
+  scale_x_log10() +
+  #guides(color=guide_legend(override.aes=list(pch=15))) +
+  theme(strip.background=element_blank(),
+        strip.clip='off',
+        legend.key.size=unit(3,'mm'),
+        legend.background = element_blank(),
+        legend.position=c(.8,.3),
+        strip.placement='outside')
+```
+
+do the same thing for the risk score
+
+```{r risk_score_proxy, fig.width=2.5, fig.height=2.}
+risk_score_rna_proxy     <- fit_proxy(t(X[['RNA']]),  setNames(as.vector(meta[['risk_score']]),row.names(meta)), "RNA",
+                                      n_features_grid = c(10, 20, 50, 100, 200))
+
+risk_score_proxy <- risk_score_rna_proxy %>%
+  ggplot(aes(x = n_actual, y = mean_r2,
+             colour = modality)) +
+  geom_line(linewidth = 0.5) +
+  geom_point(size = .5) +
+  geom_errorbar(aes(ymin=mean_r2-sd_r2, ymax=mean_r2+sd_r2), width=0)  +
+  scale_colour_manual(values = modality_colors) +
+  scale_x_log10() +
+  labs(x     = "# features",
+       y     = "cross-validation R2",
+       title = 'RNA proxy for risk score') +
+  theme_classic(base_size=8) +
+  theme(legend.position = 'none') 
+```
+
+and the prognostic power
+
+```{r risk_score_proxy_survival, fig.width=3.5, fig.height=2.5}
+risk_score_rna10_proxy_coefs <- risk_score_rna_proxy[risk_score_rna_proxy$n_actual==9,'coef_vec'][[1]][[1]]
+risk_score_rna100_proxy_coefs <- risk_score_rna_proxy[risk_score_rna_proxy$n_actual==101,'coef_vec'][[1]][[1]]
+
+risk_score_surv_res <- eval_proxy_survival(risk_score_rna_proxy,  t(X[['RNA']]),   
+                                           meta %>% tibble::rownames_to_column('sample_id')) %>%
+  dplyr::mutate(padj = p.adjust(p, method='BH'))
+
+risk_score_proxy_survival <- ggplot(risk_score_surv_res,aes(y=exp(coef), 
+                               ymin=lower,
+                               ymax=upper,
+                               x=n_actual,
+                               color=modality)) +
+  geom_hline(yintercept=c(.5,1,2,3), linetype='dashed', color='gray', width=.25) +
+  geom_hline(data = mofa2_survival_df %>%
+               dplyr::filter(score=='risk_score') %>%
+               mutate(modality = 'risk score',
+                      n_actual = NA_real_),
+             aes(yintercept = exp(coef), color = 'risk score'),
+             linetype = 'solid') +
+  geom_point(pch=15) +
+  geom_line() +
+  geom_errorbar(width=0) +
+  theme_classic(base_size=8) +
+  labs(y='Hazard ratio',x='# features', color=NULL) +
+  scale_color_manual(
+    values = c(modality_colors, 'risk score' = 'coral3')
+  ) +
+  guides(color = guide_legend(override.aes = list(pch = c(15)))) +
+  facet_grid(test~., scales='free',space='free', switch='y') +
+  scale_y_log10(breaks=c(.5,1,2,3)) +
+  scale_x_log10() +
+  theme(strip.background=element_blank(),
+        strip.clip='off',
+        legend.key.size=unit(3,'mm'),
+        legend.position=c(.8,.2),
+        strip.placement='outside')
+```
+
+show the coefficients
+
+```{r f6_proxy_coefs}
+f6_proxy_coefs <- data.frame(coef=f6_rna10_proxy_coefs) %>% 
+  tibble::rownames_to_column('gene') %>%
+  dplyr::arrange(coef) %>%
+  dplyr::mutate(gene=factor(gene, level=gene)) %>%
+  ggplot(aes(x=gene, y=1, fill=coef, label=paste0(gene,'\n',signif(coef,2)))) +
+  geom_tile(alpha=.5) +
+  geom_text(size=2) + 
+  theme_void(base_size=8) +
+  scale_fill_gradient2(low='red3',mid='gray',high='forestgreen')  +
+  labs(fill=NULL) +
+  theme(legend.position='none')
+
+risk_score_proxy_coefs <- data.frame(coef=risk_score_rna10_proxy_coefs) %>% 
+  tibble::rownames_to_column('gene') %>%
+  dplyr::arrange(coef) %>%
+  dplyr::mutate(gene=factor(gene, level=gene)) %>%
+  ggplot(aes(x=gene, y=1, fill=coef, label=paste0(gene,'\n',signif(coef,2)))) +
+  geom_tile(alpha=.5) +
+  geom_text(size=2) + 
+  theme_void(base_size=8) +
+  scale_fill_gradient2(low='red3',mid='gray',high='forestgreen') +
+  labs(fill=NULL) +
+  theme(legend.position='none')
+```
+
+validate on COMMPASS data, using tableS4A, table1A and a table with clinical annotations from GDC
+
+```{r commpass_validation, fig.width=3.5, fig.height=3}
+library(org.Hs.eg.db)
+ensg_to_symbol <- as.data.frame(org.Hs.egSYMBOL) %>% dplyr::inner_join(as.data.frame(org.Hs.egENSEMBL), by='gene_id')
+
+commpass_rna  <- read_csv('commpass/compass_tableS4A.csv',  show_col_types = FALSE) %>%
+  dplyr::inner_join(ensg_to_symbol, by=c('GENE_ID'='ensembl_id')) %>%
+  dplyr::select(-c(gene_id,GENE_ID)) %>%
+  dplyr::filter(!is.na(symbol)) %>%
+  dplyr::distinct(symbol, .keep_all = TRUE) %>%
+  column_to_rownames('symbol') %>%
+  as.matrix()
+colnames(commpass_rna) <- gsub('_1_BM','',colnames(commpass_rna))
+
+commpass_meta <- read_csv('commpass/compass_table1A.csv', show_col_types = FALSE) %>%
+  dplyr::inner_join(read.csv('commpass/clinical.tsv', sep='\t') %>%
+                      dplyr::select(cases.submitter_id, 
+                                    demographic.days_to_death, 
+                                    diagnoses.days_to_last_follow_up, 
+                                    demographic.vital_status),
+                    by=c('Patient_ID'='cases.submitter_id')) %>%
+  dplyr::distinct(Patient_ID, .keep_all = TRUE) %>%
+  dplyr::mutate(os_time=ifelse(demographic.vital_status=='Alive',
+                               as.numeric(diagnoses.days_to_last_follow_up),
+                               as.numeric(demographic.days_to_death))/30.,
+                os_event=ifelse(demographic.vital_status=='Alive',0,1)) %>%
+  dplyr::filter(!is.na(os_event),!is.na(os_time))
+  
+commpass_samples <- intersect(commpass_meta$Patient_ID, colnames(commpass_rna))
+
+get_proxy_score <- function(mat, coefs, scale=TRUE) {
+  genes <- intersect(names(coefs), row.names(mat))
+  if (scale)
+    mat_sc <- t(scale(t(mat[genes,,drop=FALSE])))
+  else
+    mat_sc <- as.matrix(mat[genes,,drop=FALSE])
+  valid <- apply(mat_sc, 1, function(x) !any(is.nan(x)))
+  mat_sc <- mat_sc[valid, ]
+  coefs_here <- coefs[row.names(mat_sc)]
+  result <- as.numeric(coefs_here %*% mat_sc)
+  names(result) <- colnames(mat_sc)
+  result
+}
+
+f6_score_commpass_10 <- get_proxy_score(log2(commpass_rna[, commpass_samples, drop=FALSE]), f6_rna10_proxy_coefs)
+f6_score_commpass_100 <- get_proxy_score(log2(commpass_rna[, commpass_samples, drop=FALSE]), f6_rna100_proxy_coefs)
+
+risk_score_commpass_10 <- get_proxy_score(log2(commpass_rna[, commpass_samples, drop=FALSE]), risk_score_rna10_proxy_coefs)
+risk_score_commpass_100 <- get_proxy_score(log2(commpass_rna[, commpass_samples, drop=FALSE]), risk_score_rna100_proxy_coefs)
+
+gg30 <- intersect(names(DS30),row.names(commpass_rna))
+commpass_clin <- commpass_meta %>%
+  dplyr::filter(Patient_ID %in% commpass_samples) %>%
+  transmute(
+    sample_id  = Patient_ID,
+    iss        = ISS_Stage,
+    f6_score_10 = f6_score_commpass_10[sample_id],
+    f6_score_100 = f6_score_commpass_100[sample_id],
+    risk_score_10 = risk_score_commpass_10[sample_id],
+    risk_score_100 = risk_score_commpass_100[sample_id],
+    ZANS5 = as.vector(ZANS5 %*% as.matrix(log2(commpass_rna[names(ZANS5),sample_id]))),
+    GEP5 = colMeans(log2(commpass_rna[c('ENO1','FABP5','TRIP13','TAGLN2','RFC4'),]))[sample_id],
+    DS30 = as.vector(DS30[gg30] %*% as.matrix(log2(1+commpass_rna[gg30,sample_id]))),
+    cytogenetic_risk = Cytogenetic_High_Risk,
+    os_time    = os_time,
+    os_event   = os_event
+  )
+
+run_cox_proxy <- function(clin_df, score, time_col, event_col, 
+                          endpoint, iss_col = NULL) {
+  df <- clin_df %>%
+    dplyr::rename(time  = all_of(time_col),
+                  event = all_of(event_col),
+                  score = all_of(score)) %>%
+    dplyr::mutate(score=scale(score)) %>%
+    dplyr::filter(!is.na(time), !is.na(event), time > 0)
+  
+  if (!is.null(iss_col)) {
+    df <- df %>% dplyr::rename(iss = all_of(iss_col)) %>%
+      dplyr::filter(!is.na(iss))
+    fit_base  <- coxph(Surv(time, event) ~ iss,         data = df)
+    fit_score <- coxph(Surv(time, event) ~ score + iss, data = df)
+  } else {
+    fit_base  <- coxph(Surv(time, event) ~ 1,           data = df)
+    fit_score <- coxph(Surv(time, event) ~ score,       data = df)
+  }
+
+  s_base  <- summary(fit_base)
+  s_score <- summary(fit_score)
+  r       <- s_score$coefficients["score", ]
+  ci       <- s_score$conf.int["score", ]
+
+  list(
+    endpoint  = endpoint,
+    n         = nrow(df),
+    HR        = exp(r["coef"]),
+    lower     = ci['lower .95'],
+    upper     = ci['upper .95'],
+    p         = r["Pr(>|z|)"],
+    c_base    = s_base$concordance["C"],
+    c_score   = s_score$concordance["C"],
+    c_score_se  = s_score$concordance["se(C)"],
+    score     = score,
+    iss_adj   = !is.null(iss_col)
+  )
+}
+
+cox_os_commpass_f6_10 <- run_cox_proxy(commpass_clin, "f6_score_10", "os_time", "os_event", "OS", "iss")
+cox_os_commpass_f6_100 <- run_cox_proxy(commpass_clin, "f6_score_100", "os_time", "os_event", "OS", "iss")
+cox_os_commpass_risk_10 <- run_cox_proxy(commpass_clin, "risk_score_10", "os_time", "os_event", "OS", "iss")
+cox_os_commpass_risk_100 <- run_cox_proxy(commpass_clin, "risk_score_100", "os_time", "os_event", "OS", "iss")
+
+cox_os_commpass_ZANS5 <- run_cox_proxy(commpass_clin, "ZANS5", "os_time", "os_event", "OS", "iss")
+cox_os_commpass_GEP5 <- run_cox_proxy(commpass_clin, "GEP5", "os_time", "os_event", "OS", "iss")
+cox_os_commpass_DS30 <- run_cox_proxy(commpass_clin, "DS30", "os_time", "os_event", "OS", "iss")
+```
+
+validate using data form GSE136337
+
+```{r validate_GSE136337, fig.width=3.5, fig.height=3.}
+library(GEOquery)
+library(Biobase)
+
+gse136337 <- getGEO("GSE136337",destdir='GEO_data')[[1]]
+expr136337 <- Biobase::exprs(gse136337)   # probes/genes × samples
+
+f6_score_136337_10 <- get_proxy_score(expr136337, f6_rna10_proxy_coefs)
+f6_score_136337_100 <- get_proxy_score(expr136337, f6_rna100_proxy_coefs)
+
+risk_score_136337_10 <- get_proxy_score(expr136337, risk_score_rna10_proxy_coefs)
+risk_score_136337_100 <- get_proxy_score(expr136337, risk_score_rna100_proxy_coefs)
+
+gg30 <- intersect(names(DS30),row.names(expr136337))
+clin136337 <- Biobase::pData(gse136337) %>%
+  tibble::rownames_to_column("sample_id") %>%
+  transmute(
+    sample_id  = sample_id,
+    pfs_time   = suppressWarnings(as.numeric(`monthspfs:ch1`)),
+    pfs_event  = as.integer(`censpfs.ar:ch1` == "FALSE"),  
+    os_time    = suppressWarnings(as.numeric(`monthsos:ch1`)),
+    os_event   = as.integer(`censos.ar:ch1` == "FALSE"),
+    iss        = suppressWarnings(as.numeric(as.roman(`iss:ch1`))),   
+    f6_score_10 = f6_score_136337_10[sample_id],
+    f6_score_100= f6_score_136337_100[sample_id],
+    risk_score_10 = risk_score_136337_10[sample_id],
+    risk_score_100 = risk_score_136337_100[sample_id],
+    ZANS5 = as.vector(ZANS5 %*% as.matrix(expr136337[names(ZANS5),sample_id])),
+    GEP5 = colMeans(expr136337[c('ENO1','FABP5','TRIP13','TAGLN2','RFC4'),])[sample_id],
+    DS30 = as.vector(DS30[gg30] %*% as.matrix(expr136337[gg30,sample_id]))
+  ) 
+
+cox_pfs_136337_f6_10 <- run_cox_proxy(clin136337, "f6_score_10", "pfs_time", "pfs_event", "PFS", "iss")
+cox_os_136337_f6_10  <- run_cox_proxy(clin136337, "f6_score_10", "os_time",  "os_event", "OS", "iss")
+cox_pfs_136337_f6_100 <- run_cox_proxy(clin136337, "f6_score_100", "pfs_time", "pfs_event", "PFS", "iss")
+cox_os_136337_f6_100  <- run_cox_proxy(clin136337, "f6_score_100", "os_time",  "os_event", "OS", "iss")
+
+cox_pfs_136337_risk_10 <- run_cox_proxy(clin136337, "risk_score_10", "pfs_time", "pfs_event", "PFS", "iss")
+cox_os_136337_risk_10  <- run_cox_proxy(clin136337, "risk_score_10", "os_time",  "os_event",  "OS", "iss")
+cox_pfs_136337_risk_100 <- run_cox_proxy(clin136337, "risk_score_100", "pfs_time", "pfs_event", "PFS", "iss")
+cox_os_136337_risk_100  <- run_cox_proxy(clin136337, "risk_score_100", "os_time",  "os_event",  "OS", "iss")
+
+cox_pfs_136337_GEP5 <- run_cox_proxy(clin136337, "GEP5", "pfs_time", "pfs_event", "PFS", "iss")
+cox_os_136337_GEP5  <- run_cox_proxy(clin136337, "GEP5", "os_time",  "os_event",  "OS", "iss")
+
+cox_pfs_136337_ZANS5 <- run_cox_proxy(clin136337, "ZANS5", "pfs_time", "pfs_event", "PFS", "iss")
+cox_os_136337_ZANS5  <- run_cox_proxy(clin136337, "ZANS5", "os_time",  "os_event",  "OS", "iss")
+
+cox_pfs_136337_DS30 <- run_cox_proxy(clin136337, "DS30", "pfs_time", "pfs_event", "PFS", "iss")
+cox_os_136337_DS30  <- run_cox_proxy(clin136337, "DS30", "os_time",  "os_event",  "OS", "iss")
+```
+
+validate using data from GSE24080 with clinical meta-data from GSE24080_MM_UAMS565_ClinInfo_27Jun2008_LS_clean.xls; derive ISS from B2M and ALB values
+
+```{r validate_GSE24080, fig.width=3.5, fig.height=3.}
+gse24080 <- getGEO("GSE24080",destdir='GEO_data')[[1]]
+
+fdata <- Biobase::fData(gse24080)
+probe_gene <- Biobase::fData(gse24080) %>%
+  dplyr::mutate(probe_id = rownames(fdata), gene_symbol = `Gene Symbol`) %>%
+  dplyr::filter(gene_symbol!="",!is.na(gene_symbol)) %>%
+  dplyr::mutate(gene_symbol = gsub(" ///.*", "", gene_symbol)) %>%
+  dplyr::select(probe_id, gene_symbol)
+
+expr24080 <- Biobase::exprs(gse24080) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("probe_id") %>%
+  dplyr::inner_join(probe_gene, by = "probe_id") %>%
+  dplyr::group_by(gene_symbol) %>%
+  dplyr::summarise(across(where(is.numeric), mean)) %>%
+  tibble::column_to_rownames("gene_symbol") # probes/genes × samples
+
+f6_score_24080_10 <- get_proxy_score(expr24080, f6_rna10_proxy_coefs)
+f6_score_24080_100 <- get_proxy_score(expr24080, f6_rna100_proxy_coefs)
+
+risk_score_24080_10 <- get_proxy_score(expr24080, risk_score_rna10_proxy_coefs)
+risk_score_24080_100 <- get_proxy_score(expr24080, risk_score_rna100_proxy_coefs)
+
+gg30 <- intersect(names(DS30),row.names(expr24080))
+clin24080 <- readxl::read_excel('GSE24080_MM_UAMS565_ClinInfo_27Jun2008_LS_clean.xls') %>%
+  dplyr::mutate(title=gsub('.CEL','',CELfilename)) %>%
+  dplyr::inner_join(Biobase::pData(gse24080), by='title') %>%
+  transmute(
+    sample_id  = geo_accession,
+    os_time    = suppressWarnings(as.numeric(`OS (months)`)),
+    os_event   = as.integer(`OS-censor`),
+    efs_time    = suppressWarnings(as.numeric(`EFS(months)`)),
+    efs_event   = as.integer(`EFS-censor`),
+    f6_score_10 = f6_score_24080_10[sample_id],
+    f6_score_100= f6_score_24080_100[sample_id],
+    risk_score_10 = risk_score_24080_10[sample_id],
+    risk_score_100 = risk_score_24080_100[sample_id],
+    B2M = as.numeric(B2M),
+    iss = case_when(
+      B2M < 3.5 & ALB >= 3.5 ~ 1L,
+      B2M >= 5.5              ~ 3L,
+      TRUE                    ~ 2L
+    ),
+    ZANS5 = as.vector(ZANS5 %*% as.matrix(expr24080[names(ZANS5),sample_id])),
+    DS30 = as.vector(DS30[gg30] %*% as.matrix(expr24080[gg30,sample_id])),
+    GEP5 = colMeans(expr24080[c('ENO1','FABP5','TRIP13','TAGLN2','RFC4'),])[sample_id]
+  ) 
+
+cox_efs_24080_f6_10 <- run_cox_proxy(clin24080, "f6_score_10", "efs_time", "efs_event", "EFS", "iss")
+cox_os_24080_f6_10  <- run_cox_proxy(clin24080, "f6_score_10", "os_time",  "os_event", "OS", "iss")
+cox_efs_24080_f6_100 <- run_cox_proxy(clin24080, "f6_score_100", "efs_time", "efs_event", "EFS", "iss")
+cox_os_24080_f6_100  <- run_cox_proxy(clin24080, "f6_score_100", "os_time",  "os_event", "OS", "iss")
+
+cox_efs_24080_risk_10 <- run_cox_proxy(clin24080, "risk_score_10", "efs_time", "efs_event", "EFS", "iss")
+cox_os_24080_risk_10  <- run_cox_proxy(clin24080, "risk_score_10", "os_time",  "os_event",  "OS", "iss")
+cox_efs_24080_risk_100 <- run_cox_proxy(clin24080, "risk_score_100", "efs_time", "efs_event", "EFS", "iss")
+cox_os_24080_risk_100  <- run_cox_proxy(clin24080, "risk_score_100", "os_time",  "os_event",  "OS", "iss")
+
+cox_efs_24080_GEP5 <- run_cox_proxy(clin24080, "GEP5", "efs_time", "efs_event", "EFS", "iss")
+cox_os_24080_GEP5  <- run_cox_proxy(clin24080, "GEP5", "os_time",  "os_event",  "OS", "iss")
+
+cox_efs_24080_ZANS5 <- run_cox_proxy(clin24080, "ZANS5", "efs_time", "efs_event", "EFS", "iss")
+cox_os_24080_ZANS5  <- run_cox_proxy(clin24080, "ZANS5", "os_time",  "os_event",  "OS", "iss")
+
+cox_efs_24080_DS30 <- run_cox_proxy(clin24080, "DS30", "efs_time", "efs_event", "EFS", "iss")
+cox_os_24080_DS30  <- run_cox_proxy(clin24080, "DS30", "os_time",  "os_event",  "OS", "iss")
+```
+
+validation summary
+
+```{r validation_summary, fig.width=5.5, fig.height=3.25}
+library(ggnewscale)
+cox_pfs_f6 <- run_cox_proxy(meta_scores, "Factor6", "pfs_in_days", "pfs", "PFS", "iss")
+cox_os_f6  <- run_cox_proxy(meta_scores, "Factor6", "os_in_days",  "os", "OS", "iss")
+
+cox_pfs_risk <- run_cox_proxy(meta_scores, "risk_score", "pfs_in_days", "pfs", "PFS", "iss")
+cox_os_risk  <- run_cox_proxy(meta_scores, "risk_score", "os_in_days",  "os",  "OS", "iss")
+
+cox_pfs_GEP5 <- run_cox_proxy(meta_scores, "GEP5", "pfs_in_days", "pfs", "PFS", "iss")
+cox_os_GEP5  <- run_cox_proxy(meta_scores, "GEP5", "os_in_days",  "os",  "OS", "iss")
+
+cox_pfs_ZANS5 <- run_cox_proxy(meta_scores, "ZANS5", "pfs_in_days", "pfs", "PFS", "iss")
+cox_os_ZANS5  <- run_cox_proxy(meta_scores, "ZANS5", "os_in_days",  "os",  "OS", "iss")
+
+cox_pfs_DS30 <- run_cox_proxy(meta_scores, "DS30", "pfs_in_days", "pfs", "PFS", "iss")
+cox_os_DS30  <- run_cox_proxy(meta_scores, "DS30", "os_in_days",  "os",  "OS", "iss")
+
+meta_scores$f6_score_10 <- get_proxy_score(t(X[['RNA']][meta_scores$sample_id,]), f6_rna10_proxy_coefs)
+meta_scores$f6_score_100 <- get_proxy_score(t(X[['RNA']][meta_scores$sample_id,]), f6_rna100_proxy_coefs)
+meta_scores$risk_score_10 <- get_proxy_score(t(X[['RNA']][meta_scores$sample_id,]), risk_score_rna10_proxy_coefs)
+meta_scores$risk_score_100 <- get_proxy_score(t(X[['RNA']][meta_scores$sample_id,]), risk_score_rna100_proxy_coefs)
+
+cox_pfs_f6_10 <- run_cox_proxy(meta_scores, "f6_score_10", "pfs_in_days", "pfs", "PFS", "iss")
+cox_os_f6_10  <- run_cox_proxy(meta_scores, "f6_score_10", "os_in_days",  "os", "OS", "iss")
+cox_pfs_risk_10 <- run_cox_proxy(meta_scores, "risk_score_10", "pfs_in_days", "pfs", "PFS", "iss")
+cox_os_risk_10  <- run_cox_proxy(meta_scores, "risk_score_10", "os_in_days",  "os",  "OS", "iss")
+
+cox_pfs_f6_100 <- run_cox_proxy(meta_scores, "f6_score_100", "pfs_in_days", "pfs", "PFS", "iss")
+cox_os_f6_100  <- run_cox_proxy(meta_scores, "f6_score_100", "os_in_days",  "os", "OS", "iss")
+cox_pfs_risk_100 <- run_cox_proxy(meta_scores, "risk_score_100", "pfs_in_days", "pfs", "PFS", "iss")
+cox_os_risk_100  <- run_cox_proxy(meta_scores, "risk_score_100", "os_in_days",  "os",  "OS", "iss")
+
+validation_df <- bind_rows(
+  c(cox_os_f6, cohort='Ramberger', modality='multi-modal', N='all'),
+  c(cox_os_risk, cohort='Ramberger', modality='protein',N='8'),
+  c(cox_os_ZANS5, cohort='Ramberger', modality='RNA',N='5'),
+  c(cox_os_GEP5, cohort='Ramberger', modality='RNA',N='5'),
+  c(cox_os_DS30, cohort='Ramberger', modality='RNA',N='30'),
+  c(cox_pfs_f6, cohort='Ramberger', modality='multi-modal',N='all'),
+  c(cox_pfs_risk, cohort='Ramberger', modality='protein',N='8'),
+  c(cox_pfs_ZANS5, cohort='Ramberger', modality='RNA',N='5'),
+  c(cox_pfs_GEP5, cohort='Ramberger', modality='RNA',N='5'),
+  c(cox_pfs_DS30, cohort='Ramberger', modality='RNA',N='30'),
+  c(cox_os_f6_10, cohort='Ramberger', modality='RNA proxy', N='10'),
+  c(cox_os_risk_10, cohort='Ramberger', modality='RNA proxy',N='10'),
+  c(cox_pfs_f6_10, cohort='Ramberger', modality='RNA proxy',N='10'),
+  c(cox_pfs_risk_10, cohort='Ramberger', modality='RNA proxy',N='10'),
+  c(cox_os_f6_100, cohort='Ramberger', modality='RNA proxy', N='100'),
+  c(cox_os_risk_100, cohort='Ramberger', modality='RNA proxy',N='100'),
+  c(cox_pfs_f6_100, cohort='Ramberger', modality='RNA proxy',N='100'),
+  c(cox_pfs_risk_100, cohort='Ramberger', modality='RNA proxy',N='100'),
+  c(cox_os_commpass_f6_10, cohort='Skerget', modality='RNA proxy',N='10'),
+  c(cox_os_commpass_f6_100, cohort='Skerget', modality='RNA proxy',N='100'),
+  c(cox_os_commpass_risk_10, cohort='Skerget', modality='RNA proxy',N='10'),
+  c(cox_os_commpass_risk_100, cohort='Skerget', modality='RNA proxy',N='100'),
+  c(cox_os_commpass_GEP5, cohort='Skerget', modality='RNA',N='5'),
+  c(cox_os_commpass_ZANS5, cohort='Skerget', modality='RNA',N='5'),
+  c(cox_os_commpass_DS30, cohort='Skerget', modality='RNA',N='30'),
+  c(cox_os_136337_f6_10, cohort='Danziger', modality='RNA proxy',N='10'),
+  c(cox_os_136337_f6_100, cohort='Danziger', modality='RNA proxy',N='100'),
+  c(cox_os_136337_risk_10, cohort='Danziger', modality='RNA proxy',N='10'),
+  c(cox_os_136337_risk_100, cohort='Danziger', modality='RNA proxy',N='100'),
+  c(cox_os_136337_GEP5, cohort='Danziger', modality='RNA',N='5'),
+  c(cox_os_136337_ZANS5, cohort='Danziger', modality='RNA',N='5'),
+  c(cox_os_136337_DS30, cohort='Danziger', modality='RNA',N='30'),
+  c(cox_pfs_136337_f6_10, cohort='Danziger', modality='RNA proxy',N='10'),
+  c(cox_pfs_136337_f6_100, cohort='Danziger', modality='RNA proxy',N='100'),
+  c(cox_pfs_136337_risk_10, cohort='Danziger', modality='RNA proxy',N='10'),
+  c(cox_pfs_136337_risk_100, cohort='Danziger', modality='RNA proxy',N='100'),
+  c(cox_pfs_136337_GEP5, cohort='Danziger', modality='RNA',N='5'),
+  c(cox_pfs_136337_ZANS5, cohort='Danziger', modality='RNA',N='5'),
+  c(cox_pfs_136337_DS30, cohort='Danziger', modality='RNA',N='30'),
+  c(cox_os_24080_f6_10, cohort='Shi', modality='RNA proxy',N='10'),
+  c(cox_os_24080_f6_100, cohort='Shi', modality='RNA proxy',N='100'),
+  c(cox_os_24080_risk_10, cohort='Shi', modality='RNA proxy',N='10'),
+  c(cox_os_24080_risk_100, cohort='Shi', modality='RNA proxy',N='100'),
+  c(cox_os_24080_GEP5, cohort='Shi', modality='RNA',N='5'),
+  c(cox_os_24080_ZANS5, cohort='Shi', modality='RNA',N='5'),
+  c(cox_os_24080_DS30, cohort='Shi', modality='RNA',N='30'),
+  c(cox_efs_24080_f6_10, cohort='Shi', modality='RNA proxy',N='10'),
+  c(cox_efs_24080_f6_100, cohort='Shi', modality='RNA proxy',N='100'),
+  c(cox_efs_24080_risk_10, cohort='Shi', modality='RNA proxy',N='10'),
+  c(cox_efs_24080_risk_100, cohort='Shi', modality='RNA proxy',N='100'),
+  c(cox_efs_24080_GEP5, cohort='Shi', modality='RNA',N='5'),
+  c(cox_efs_24080_ZANS5, cohort='Shi', modality='RNA',N='5'),
+  c(cox_efs_24080_DS30, cohort='Shi', modality='RNA',N='30')) %>%
+  dplyr::mutate(
+    score=factor(ifelse(grepl('risk',score),'risk score', ifelse(grepl('Factor6|f6',score),'F6',score)),
+                 levels=c('F6','risk score','ZANS5','GEP5','DS30')),
+    cohort=factor(cohort, levels=c('Ramberger','Shi','Danziger','Skerget'), 
+                  labels=c('Ramberger et al.',
+                           'Shi et al.',
+                           'Danziger et al.',
+                           'Skerget et al.')), 
+    N=factor(N, levels=c('5','8','10','30','100','all')),
+    endpoint=paste0(endpoint, ' (n=',n,')'),
+    padj=p.adjust(p, method='BH')) 
+
+dodge <- position_dodge(width=.8)
+x_levels <- levels(factor(mpg$class))
+
+stripes <- data.frame(
+  xmin = seq_along(levels(validation_df$score)) - 0.5,
+  xmax = seq_along(levels(validation_df$score)) + 0.5,
+  fill = levels(validation_df$score))
+
+validation_summary <- ggplot(validation_df,
+       aes(y=c_score, ymin=c_score - c_score_se, ymax=c_score + c_score_se,
+           x=score, color=ifelse(padj < .05,'<.05','n.s.'), shape=modality, group=interaction(modality, N))) + 
+  geom_rect(
+    data = stripes,
+    aes(xmin = xmin, xmax = xmax, fill=fill),
+    ymin = -Inf, ymax = Inf,
+    inherit.aes = FALSE, alpha = 0.15
+  ) +
+  scale_fill_manual(values=brewer.pal('Set2',n=5), guide='none') + 
+  new_scale_fill() +
+  geom_point(aes(size=N,fill=modality),position=dodge) +
+  geom_errorbar(width=0, position=dodge, linewidth=.25) +
+  ggh4x::facet_nested(~cohort + endpoint) + #, nest_line=element_line(linewidth=.25), solo_line=TRUE) +
+  theme_classic(base_size=8) +
+  theme(strip.background=element_blank(),
+        axis.text.x=element_text(angle=45, hjust=1, vjust=1),
+        legend.key.size=unit(3,'mm'),
+        legend.box='horizontal',
+        panel.border = element_rect(colour = "gray", fill = NA, linewidth = 0.25),
+        panel.spacing=unit(0,'mm')) +
+  scale_size_manual(values=c('5'=.5,'8'=.6,'10'=.7,'30'=.9,'100'=1.1,'all'=1.2),
+                    breaks=c('5','10','100')) +
+  scale_color_manual(values=c('n.s.'='gray','<.05'='red3')) +
+  scale_shape_manual(values=c(21,22,23,24,25)) +
+  scale_fill_brewer(palette='Set1') +
+  labs(x=NULL, y='C index', shape='score type', size='# features', color='adj. p-value', fill='score type')
+```
+
+```{r Fig5, fig.width=5.5, fig.height=4.5, cache=FALSE}
+leg_score <- get_legend(validation_summary + guides(color = "none", size="none"))
+leg_pval <- get_legend(validation_summary + guides(fill = "none", shape="none", size = "none") + theme(legend.direction = 'horizontal', legend.key.width=unit(6,'mm'),
+                                                                                          legend.title.position='top'))
+leg_size <- get_legend(validation_summary + guides(color = "none", fill = "none", shape="none"))
+
+legend_combined <- plot_grid(
+  plot_grid(leg_score, leg_size, ncol = 2),
+  leg_pval,
+  ncol = 1
+)
+
+plot_grid(plot_grid(mofa2_factor6_proxy, mofa2_factor6_proxy_survival, ncol=2, labels=c('A','B'), rel_widths=c(.4,.6)),
+          f6_proxy_coefs + theme(plot.title=element_text(hjust=.08)) + labs(title='11-gene RNA proxy for F6'),
+          plot_grid(validation_summary + theme(legend.position='none'), 
+                    legend_combined, ncol=2, rel_widths=c(.75,.25)), labels=c('','C','D'), label_y=c(1, 1.1, 1),ncol=1, align='vh',
+          rel_heights=c(.45,.1,.45))
+```
+
+```{r FigS5, fig.width=3, fig.height=4.5, cache=FALSE}
+plot_grid(risk_score_proxy, 
+          risk_score_proxy_survival, 
+          risk_score_proxy_coefs +labs(title='') + theme(plot.title=element_text(hjust=.2)), 
+          ncol=1, align='vh', 
+          labels=c('A','B','C'), rel_heights=c(.4,.5,.1),label_y=c(1.03,1,1.1))
+```
+
+```{r sessionInfo}
+library(pander)
+pander(sessionInfo())
+```
